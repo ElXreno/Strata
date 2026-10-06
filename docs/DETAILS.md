@@ -728,6 +728,9 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
+- A restore does not hold the K/V in RAM: a first pass validates the whole file, a second copies the K/V into the engine's pools
+  16 MiB at a time, so a session larger than RAM restores. The second pass must see the sizes and payload hash the first saw;
+  a difference found after its first block ends the engine, so the file must have no writer but this engine.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what
   the cells mean (engine version, CUDA or HIP, `--kv`, `STRATA_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the
   rope configuration, a loaded control vector and the arithmetic switches). Sampling, seeds, draft tuning and the expert
