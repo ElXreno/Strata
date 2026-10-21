@@ -4276,6 +4276,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
+    capture_oom_ = false;
     // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
     // capture() reads as "captured" when it is not null)
     cudaGraphExec_t got = nullptr;
@@ -4307,12 +4308,35 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
                              "sizes (they are captured again when used; a larger --vram-reserve-mib or "
                              "--vram-reserve-later-mib keeps them)\n", keep_t, freed_sizes);
     if (ie != cudaSuccess) {
+        capture_oom_ = ie == cudaErrorMemoryAllocation;
+        if (capture_oom_) (void) cudaGetLastError();
         got = nullptr;
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
     ex = got;
     return true;
+}
+
+bool Verifier::prepare(int T, int64_t pos0, bool& no_vram, std::string& err) {
+    no_vram = false;
+#if defined(STRATA_GPU_METAL)
+    (void) T;
+    (void) pos0;
+    (void) err;
+    return true;
+#else
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (next_ != nullptr || lb_ > 0) return true;
+    const OnDevice on_device(device_);
+    refresh_ar();
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // (as run() will at pos0)
+    if ((ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]) != nullptr) return true;
+    capture_oom_ = false;
+    if (capture(T, err)) return true;
+    no_vram = capture_oom_;
+    return false;
+#endif
 }
 
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
