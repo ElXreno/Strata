@@ -3672,6 +3672,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
+    capture_oom_ = false;
     cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
     int freed = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
@@ -3686,10 +3687,32 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
                              "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
     if (ie != cudaSuccess) {
+        capture_oom_ = ie == cudaErrorMemoryAllocation;
+        if (capture_oom_) (void) cudaGetLastError();
+        ex = nullptr;
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
     return true;
+}
+
+bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
+    no_vram = false;
+#if defined(STRATA_GPU_METAL)
+    (void) T;
+    (void) err;
+    return true;
+#else
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (next_ != nullptr || lb_ > 0) return true;
+    const OnDevice on_device(device_);
+    refresh_ar();
+    if ((ar_off_ ? exec_nr_[T] : exec_[T]) != nullptr) return true;
+    capture_oom_ = false;
+    if (capture(T, err)) return true;
+    no_vram = capture_oom_;
+    return false;
+#endif
 }
 
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
