@@ -1100,7 +1100,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
         const char* dbg = std::getenv("STRATA_DBG_GDN");
         return (sp && sp[0] == '1') || (cs && cs[0] == '0') || (dbg && dbg[0] == '1');
     }();
-    if (per_layer || n_layers <= 0 || n_layers > 65535 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr ||
+    // n_max: the window's rows (kVerifyLongT with --lookup-max-t; both kernels loop over the kept rows, no per-row arrays)
+    if (per_layer || n_layers <= 0 || n_layers > 65535 || n_max < 1 || n_max > kVerifyLongT || n_keep == nullptr ||
         h_v <= 0 || h_k <= 0 || h_v % h_k != 0)
         return false;
     cudaStream_t st = (cudaStream_t) stream;

@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -96,7 +97,7 @@ public:
     /// the flags guarded, so this verifier refuses every later window.  True when the streams finished.
     bool release_gpu_waits(int timeout_ms);
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `max_t` <= kVerifyLongT (past kVerifyMaxT: one-conversation windows only).  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
@@ -578,11 +579,11 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
-    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
-    int64_t prof_t_win_[9] = {};
+    double prof_t_sum_[strata::kernels::kVerifyLongT + 1][2][kProfPer] = {};   // the same per window size T (1..16), for profile_by_t_report
+    int64_t prof_t_win_[strata::kernels::kVerifyLongT + 1] = {};
     bool rs_on_ = false;                      // STRATA_ROUTE_STATS
     unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
-    int64_t rs_win_[9] = {};
+    int64_t rs_win_[strata::kernels::kVerifyLongT + 1] = {};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -594,7 +595,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kVerifyLongT] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
@@ -607,9 +608,9 @@ private:
     cudaEvent_t df_join_[2] = {};
     // [sel_long_][T]: 1 is the long-context QSA select (STRATA_SELECT_LONG=1: multi-CTA top-k, shuffle-free decode
     // scores; see run()); without it only [0] is ever captured
-    cudaGraphExec_t exec_[2][9] = {};
-    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
+    cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
@@ -678,7 +679,7 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
-    int groups_[9] = {};
+    int groups_[strata::kernels::kVerifyLongT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

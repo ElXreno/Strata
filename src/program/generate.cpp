@@ -871,7 +871,7 @@ struct Options {
     /// verify window (the window grows to at most 8).  Greedy verification keeps the output; its own counts are kept.
     int lookup_chain = 0;
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
-    /// --lookup-max-t N (opt-in, 0 = the --spec + 2 rule): prompt-lookup windows up to N tokens (<= kVerifyMaxT) while
+    /// --lookup-max-t N (opt-in, 0 = the --spec + 2 rule): prompt-lookup windows up to N tokens (<= kVerifyLongT) while
     /// the MTP keeps its --spec windows.  A copy-heavy turn (an edit that rewrites a file) accepts nearly every lookup
     /// draft, so its decode is bound by the window length.  Each window size is a graph of its own (~20-35 MiB of
     /// VRAM), so only --lookup-sizes get one past the MTP's sizes; a size whose graph finds no VRAM is dropped.
@@ -1042,7 +1042,7 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
-                 "  --lookup-max-t N     opt-in: prompt-lookup windows up to N tokens (the MTP keeps --spec); copy-heavy\n"
+                 "  --lookup-max-t N     opt-in: prompt-lookup windows up to N (<= 16) tokens (the MTP keeps --spec); copy-heavy\n"
                  "                       edits gain, each extra window size costs a graph (~20-35 MiB of VRAM)\n"
                  "  --lookup-sizes A,B   the lookup window sizes past the MTP's (default: MTP+1, MTP+2 and N)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
@@ -3848,7 +3848,7 @@ int main(int argc, char** argv) {
     // --lookup-max-t N (opt-in): lookup windows up to N tokens, the MTP's stay at --spec
     if (o.lookup_max_t > 0 && o.suffix_draft > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
-        o.spec = std::max(o.spec, std::min(o.lookup_max_t, strata::kernels::kVerifyMaxT));
+        o.spec = std::max(o.spec, std::min(o.lookup_max_t, strata::kernels::kVerifyLongT));
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -6313,7 +6313,9 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        // (--lookup-max-t past kVerifyMaxT: the drafter keeps kVerifyMaxT rows, MtpDrafter::draft_long catches a longer
+        // window up in parts)
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : std::min(o.spec, strata::kernels::kVerifyMaxT);
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
@@ -9968,7 +9970,7 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyLongT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -12526,9 +12528,11 @@ int main(int argc, char** argv) {
                 return k;
             });
         policy.set_sizes(lookup_size_mask(o));
+        // a layer split's hand-off buffers hold kVerifyMaxT rows: its windows stay at that
+        if (n_stages > 1) policy.set_sizes(policy.sizes() & ((2u << strata::kernels::kVerifyMaxT) - 1u));
         if (o.lookup_max_t > 0)
             std::fprintf(stderr, "strata serve: --lookup-max-t %d: MTP windows up to %d tokens, window sizes %s\n",
-                         o.lookup_max_t, S_mtp, size_list(lookup_size_mask(o), S).c_str());
+                         o.lookup_max_t, S_mtp, size_list(policy.sizes(), S).c_str());
         // --lookup-max-t: a lookup window's graph is captured before its round; a size whose graph finds no VRAM is
         // dropped for good (the policy never picks it again) and the round takes the next smaller allowed size.
         // -1: a capture failed for another reason (err says why).
@@ -17353,7 +17357,7 @@ int main(int argc, char** argv) {
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                     mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                                nullptr, gated_proposal ? &generation : nullptr);
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -18825,7 +18829,7 @@ int main(int argc, char** argv) {
                 return true;
             }
 #endif
-            return mtp.draft(T_, outv.data(), p, a_, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
+            return mtp.draft_long(T_, outv.data(), p, a_, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
                              nullptr, gated_proposal ? &generation : nullptr);
         };
         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
