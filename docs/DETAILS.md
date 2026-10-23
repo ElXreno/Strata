@@ -640,6 +640,27 @@ stage. Parked snapshots are not kept across restarts; session files are. `STRATA
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
 
+### Conversation cache on disk (opt-in)
+
+`--conversation-cache-spill-dir DIR` keeps a parked conversation that RAM pressure or `--conversation-cache-slots` evicts: it
+is written to `DIR` as an ordinary session file (`.sess`, the same format and model/configuration identity as the
+[session files](#session-files-disk)) plus a `.meta` sidecar with its token and image lists, so a later request, also after a
+restart, can resume from it. The directory is scanned at start; a sidecar whose session file is missing or whose checksum
+fails is removed, a file of another model or configuration is refused. On a clean `QUIT` or stdin close the active
+conversation is captured and the parked ones are spilled. Use a separate directory per model.
+
+| Option | Effect |
+| --- | --- |
+| `--conversation-cache-disk-mib N` | Cap on this model's spill files, default 8192; `0` disables the disk tier. The index holds at most 256 conversations, oldest evicted first. |
+| `--conversation-cache-similarity F` | A disk hit must cover more than this fraction of the new prompt (`common_prefix_tokens / new_prompt_tokens`). Default 0. |
+| `--conversation-cache-n-min N` | A disk hit must share at least N prompt tokens. Default 0. |
+
+Only a saved checkpoint whose token and image keys are an exact prefix of the new prompt is restored; the last prompt token
+stays unread. A disk hit is read into host RAM first, so it must fit the RAM cache budget and the
+`--conversation-cache-min-free-mib` floor, or the prompt is read normally. The cache stays off unless
+`--conversation-cache-mib` is nonzero; `--prompt-cache 0` or `--conversation-cache-slots 0` disables it, and so does
+`--layer-split`.
+
 ### Session files (disk)
 
 The conversation the engine holds can be saved to a file and restored later, also after a restart of the same engine version,
