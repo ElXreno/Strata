@@ -62,4 +62,7 @@ bool cvec_tables(const float** dir, const float** s, const int** on);
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
 
+/// STRATA_CB_DIR: write the last staged row of every steered layer to <dir>/l_out-<layer>.f32
+void cvec_cb_flush();
+
 }  // namespace strata::kernels
