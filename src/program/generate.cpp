@@ -9539,7 +9539,7 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (disk_only) {
-                if (!disk_continuing) disk_save_live(false, "switch");
+                if (!disk_continuing && conversations.wants((int64_t) live.size())) disk_save_live(false, "switch");
                 return true;
             }
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
@@ -16022,7 +16022,7 @@ int main(int argc, char** argv) {
             }
         }
         if (conversation_spill.enabled() && disk_only) {   // the live conversation goes to disk, flushed
-            disk_save_live(true, "shutdown");
+            if (conversations.wants((int64_t) live.size())) disk_save_live(true, "shutdown");
         } else if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
             if (!park_current(0))
                 std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",
