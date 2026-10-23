@@ -175,6 +175,28 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     return true;
 }
 
+bool cvec_update(const std::vector<float>& dir, const std::vector<float>& s, std::string& err) {
+    if (!g_cvec.loaded()) { err = "control vector: nothing loaded to update"; return false; }
+    if (dir.size() != g_dir_host.size() || s.size() != g_s_host.size()) { err = "control vector: the new tables differ in size"; return false; }
+    int prev = 0;
+    cudaGetDevice(&prev);
+    for (int d = 0; d < kDevices; ++d) {
+        if (g_dev[d].dir == nullptr) continue;
+        cudaSetDevice(d);
+        cudaDeviceSynchronize();
+        if (cudaMemcpy(g_dev[d].dir, dir.data(), dir.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(g_dev[d].s, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaSetDevice(prev);
+            err = "control vector: device copy failed";
+            return false;
+        }
+    }
+    cudaSetDevice(prev);
+    g_dir_host = dir;
+    g_s_host = s;
+    return true;
+}
+
 bool cvec_replicate(std::string& err) { return !g_cvec.loaded() || upload_here(err); }
 
 void cvec_set_enabled(bool on) {
