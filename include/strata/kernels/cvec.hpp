@@ -26,13 +26,15 @@ struct Cvec {
     const float* dir = nullptr;   ///< device, n_layers * n_embd: project = the unit v_l, add = d_l; zero rows elsewhere
     const float* s = nullptr;     ///< device, n_layers: project = s_l, add = 1; 0 = the layer is not steered
     const int* on = nullptr;      ///< device int: 0 = this request runs the stock model
-    int mode = 0;                 ///< 0 = project, 1 = add
+    int mode = 0;                 ///< 0 = project, 1 = add, 2 = delta (project each block's own write)
     int first = 0, last = -1;     ///< the steered layers, inclusive
     int64_t n_embd = 0, hc = 0;
     bool loaded() const { return dir != nullptr; }
     /// Layer l's FFN write is followed by the vector (with a real direction there).  Decided at load time, never
     /// per request: it changes where the residual write happens, so the graphs depend on it.
-    bool covers(int64_t l) const { return loaded() && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
+    bool covers(int64_t l) const { return loaded() && mode != 2 && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
+    /// --cvec-mode delta: layer l's attention and FFN outputs are projected before they reach the residual.
+    bool covers_delta(int64_t l) const { return loaded() && mode == 2 && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
     std::vector<bool> steered;    ///< host copy of s_l != 0
 };
 
@@ -61,6 +63,9 @@ bool cvec_tables(const float** dir, const float** s, const int** on);
 /// whose writes are folded into the next layer's read; without it, R must already hold the layer's output.
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
+
+/// --cvec-mode delta: T block outputs (`bo + t * ld`, n_embd each) lose s_l (bo . v_l) v_l.  No-op unless covers_delta.
+void cvec_delta(float* bo, int64_t layer, int64_t T, int64_t ld, void* stream);
 
 /// STRATA_CB_DIR: write the last staged row of every steered layer to <dir>/l_out-<layer>.f32
 void cvec_cb_flush();
