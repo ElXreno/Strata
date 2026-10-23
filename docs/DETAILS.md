@@ -654,12 +654,24 @@ conversation is captured and the parked ones are spilled. Use a separate directo
 | `--conversation-cache-disk-mib N` | Cap on this model's spill files, default 8192; `0` disables the disk tier. The index holds at most 256 conversations, oldest evicted first. |
 | `--conversation-cache-similarity F` | A disk hit must cover more than this fraction of the new prompt (`common_prefix_tokens / new_prompt_tokens`). Default 0. |
 | `--conversation-cache-n-min N` | A disk hit must share at least N prompt tokens. Default 0. |
+| `--conversation-cache-disk-only` | The cache on disk alone, with no RAM budget (`--conversation-cache-mib` unused). Single GPU, without `--batch` or `--peer-device`. |
 
 Only a saved checkpoint whose token and image keys are an exact prefix of the new prompt is restored; the last prompt token
 stays unread. A disk hit is read into host RAM first, so it must fit the RAM cache budget and the
 `--conversation-cache-min-free-mib` floor, or the prompt is read normally. The cache stays off unless
 `--conversation-cache-mib` is nonzero; `--prompt-cache 0` or `--conversation-cache-slots 0` disables it, and so does
 `--layer-split`.
+
+With `--conversation-cache-disk-only` a conversation that loses the engine is written the way a session save writes it, the
+K/V streamed from the pools into the file, and read back the way a streaming restore reads it: a read pass checks the whole
+file before the GPU state changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools
+16 MiB at a time. The new file is written before older copies are removed, `--conversation-cache-disk-mib` is the only size
+limit, the next turn of the same conversation writes nothing, and a clean shutdown saves the live conversation. It also keeps
+**prefix entries** (`strata-conv-prefix-N`): a conversation's shared opening (the deepest `"strata_prefix"` checkpoint, else
+the root) is saved once on its own, so a new conversation that opens the same way, such as a coding agent's next session,
+resumes from it. Prefix entries survive restarts and are evicted after every ordinary conversation. On a Ryzen AI Max+ 395
+with three alternating agent conversations a later turn read its prompt in 2.3-3.6 s instead of 11.4-22.3 s; a switch wrote
+360-443 MiB in 181-196 ms and a return read it in 291-351 ms.
 
 ### Session files (disk)
 
