@@ -101,6 +101,40 @@ __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir
     }
 }
 
+__global__ void cvec_delta_kernel(float* __restrict__ bo, const float* __restrict__ dir, const float* __restrict__ s_l,
+                                  const int* __restrict__ on, int64_t layer, int n, int64_t ld) {
+    const float s = s_l[layer];
+    if (*on == 0 || s == 0.0f) return;
+    float* x = bo + (int64_t) blockIdx.x * ld;
+    const float* v = dir + layer * n;
+    float xv[MAXK];
+    float dot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAXK; ++k) {
+        const int d = threadIdx.x + k * THREADS;
+        xv[k] = d < n ? x[d] : 0.0f;
+        if (d < n) dot = fmaf(xv[k], v[d], dot);
+    }
+    __shared__ float part[THREADS / 32];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = dot;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float p = threadIdx.x < THREADS / 32 ? part[threadIdx.x] : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffu, p, o);
+        if (threadIdx.x == 0) part[0] = p;
+    }
+    __syncthreads();
+    dot = part[0] * s;
+#pragma unroll
+    for (int k = 0; k < MAXK; ++k) {
+        const int d = threadIdx.x + k * THREADS;
+        if (d < n) x[d] = fmaf(-dot, v[d], xv[k]);
+    }
+}
+
 }  // namespace
 
 const Cvec& cvec() { return g_cvec; }
@@ -181,6 +215,15 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
     if (g_cb_host != nullptr && layer >= 0 && layer < kCbLayers && r_ld <= kCbWidth)
         cudaMemcpyAsync(g_cb_host + layer * kCbWidth, R + (T - 1) * r_ld, (size_t) r_ld * sizeof(float),
                         cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+}
+
+void cvec_delta(float* bo, int64_t layer, int64_t T, int64_t ld, void* stream) {
+    if (!g_cvec.covers_delta(layer) || T < 1) return;
+    const DevTables& t = g_dev[cur_device()];
+    if (t.dir == nullptr) throw std::runtime_error("cvec_delta: the control vector is not on this device (cvec_replicate)");
+    cvec_delta_kernel<<<(unsigned) T, THREADS, 0, (cudaStream_t) stream>>>(bo, t.dir, t.s, t.on, layer,
+                                                                          (int) g_cvec.n_embd, ld);
+    if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_delta: launch failed");
 }
 
 void cvec_cb_flush() {

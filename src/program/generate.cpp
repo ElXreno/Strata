@@ -1053,7 +1053,8 @@ void usage() {
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
-                 "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
+                 "  --cvec-mode add|project|delta  h += s v (default), h -= s (h.v) v with v unit, or the same on each\n"
+                 "                       attention and FFN output before it reaches the residual\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
@@ -2075,7 +2076,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     }
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
     const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
-    const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
+    const int single = o.cvec_mode != 1 ? o.cvec_single : -1;
     if (single >= 0 && (single >= L || !have[(size_t) single])) {
         err = "--cvec-dir single:" + std::to_string(single) + ": the vector has no direction for that layer";
         return false;
@@ -2086,7 +2087,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         const int64_t src = single >= 0 ? single : l;
         if (!have[(size_t) src]) continue;
         const float* d = data.data() + (size_t) (src * N);
-        if (o.cvec_mode == 0) {
+        if (o.cvec_mode != 1) {
             double nrm = 0.0;
             for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
             nrm = std::sqrt(nrm);
@@ -2112,11 +2113,11 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"
     }
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
+    summary = std::string(o.cvec_mode == 0 ? "project" : o.cvec_mode == 2 ? "delta" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
     std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+                 o.cvec_mode == 0 ? "project" : o.cvec_mode == 2 ? "delta" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
 }
 
@@ -3303,7 +3304,8 @@ int main(int argc, char** argv) {
             const std::string m = next("--cvec-mode");
             if (m == "project") o.cvec_mode = 0;
             else if (m == "add") o.cvec_mode = 1;
-            else { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
+            else if (m == "delta") o.cvec_mode = 2;
+            else { std::fprintf(stderr, "--cvec-mode: add, project or delta, got '%s'\n", m.c_str()); return 2; }
         }
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
