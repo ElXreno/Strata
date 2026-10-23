@@ -1545,7 +1545,7 @@ st_begin(layer, 0, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
-    st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
+    st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    strata::kernels::cvec_delta(bb.block_out, layer, 1, g.n_embd, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
     if (run2) {
     st_begin(layer, 2, stream);    if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
 // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
@@ -1611,7 +1611,7 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
 st_begin(layer, 5, stream);
     if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
-    st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
+    st_end(layer, 5, stream);    strata::kernels::cvec_delta(bb.block_out, layer, 1, g.n_embd, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
         if (!(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
