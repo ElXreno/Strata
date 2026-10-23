@@ -45,6 +45,10 @@ const Cvec& cvec();
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err);
 
+/// Replace the loaded tables in place (same sizes): the captured graphs keep their pointers, and the steered layers,
+/// range and mode stay as loaded.  A layer whose new scale is 0 is skipped by the kernels.
+bool cvec_update(const std::vector<float>& dir, const std::vector<float>& s, std::string& err);
+
 /// A layer split: put the loaded vector's tables on the CURRENT device too (cvec_apply uses the tables of the device
 /// it runs on).  No-op without a vector or when this device has them already.
 bool cvec_replicate(std::string& err);
