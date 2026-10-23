@@ -3,7 +3,11 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -18,6 +22,9 @@ constexpr int kDevices = 64;
 struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
 DevTables g_dev[kDevices];
 std::vector<float> g_dir_host, g_s_host;
+// STRATA_CB_DIR: the last row of R after each steered layer, staged in pinned memory (capturable) per request
+constexpr int64_t kCbLayers = 128, kCbWidth = 16384;
+float* g_cb_host = nullptr;
 int cur_device() {
     int d = 0;
     if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= kDevices) d = 0;
@@ -129,6 +136,8 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     g_cvec.hc = hc;
     g_cvec.steered.assign(s.size(), false);
     for (size_t l = 0; l < s.size(); ++l) g_cvec.steered[l] = s[l] != 0.0f;
+    if (const char* cb = std::getenv("STRATA_CB_DIR"); cb != nullptr && *cb != '\0' && g_cb_host == nullptr)
+        cudaHostAlloc((void**) &g_cb_host, (size_t) kCbLayers * kCbWidth * sizeof(float), cudaHostAllocDefault);
     return true;
 }
 
@@ -169,6 +178,23 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
+    if (g_cb_host != nullptr && layer >= 0 && layer < kCbLayers && r_ld <= kCbWidth)
+        cudaMemcpyAsync(g_cb_host + layer * kCbWidth, R + (T - 1) * r_ld, (size_t) r_ld * sizeof(float),
+                        cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+}
+
+void cvec_cb_flush() {
+    static const char* dir = std::getenv("STRATA_CB_DIR");
+    if (g_cb_host == nullptr || dir == nullptr) return;
+    cudaDeviceSynchronize();
+    for (int64_t l = 0; l < (int64_t) g_cvec.steered.size() && l < kCbLayers; ++l) {
+        if (!g_cvec.covers(l)) continue;
+        const std::string path = std::string(dir) + "/l_out-" + std::to_string(l) + ".f32";
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(g_cb_host + l * kCbWidth, sizeof(float), (size_t) (g_cvec.hc * g_cvec.n_embd), f);
+            std::fclose(f);
+        }
+    }
 }
 
 }  // namespace strata::kernels
