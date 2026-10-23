@@ -64,6 +64,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve import websearch  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -4074,6 +4075,7 @@ class Service:
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
+        self.web_search = None                           # serve/websearch.py's settings when SearXNG is configured
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -6040,6 +6042,90 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
+def run_with_web_search(svc: Service, specs, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                        force=None):
+    """Service.run with Anthropic's web_search server tool executed here against SearXNG (serve/websearch.py): the
+    model calls it, the server searches, adds the call and the results to the conversation and lets the model go on.
+    Yields what Service.run yields plus ("web_search", {...}) for each call and its result, and one ("done", ...) at
+    the end with the output tokens of every round and the number of searches.  `specs`: the request's server tools
+    by name.  A forced tool_choice applies to the first round only."""
+    settings = svc.web_search
+    limit = {n: min(int(t.get("max_uses") or settings["max_uses"]), settings["max_uses"]) for n, t in specs.items()}
+    uses = dict.fromkeys(specs, 0)
+    total, rounds, done = 0, 0, None
+    messages = list(messages)
+    while True:
+        text, reasoning, calls, own_calls = [], [], [], 0
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, force=force, declared_only=True):
+            if kind == "done":
+                done = x
+                continue
+            if kind == "event":
+                ev: Event = x
+                if ev.call is not None and ev.call.name in specs:
+                    if ev.kind == "tool_call":
+                        calls.append(ev.call)
+                    continue
+                if ev.kind == "tool_call":
+                    own_calls += 1
+                elif ev.kind == "content":
+                    text.append(ev.text)
+                elif ev.kind == "reasoning":
+                    reasoning.append(ev.text)
+            yield kind, x
+        total += done["completion_tokens"]
+        force = None
+        if not calls or own_calls or done["finish"] != "stop" or cancel.is_set() or rounds > settings["max_uses"]:
+            break
+        rounds += 1
+        results = []
+        for c in calls:
+            spec = specs[c.name]
+            query = c.arguments.get("query") if isinstance(c.arguments, dict) else None
+            yield "web_search", {"event": "call", "id": c.id, "name": c.name, "input": c.arguments}
+            if uses[c.name] >= limit[c.name]:
+                r = {"ok": False, "error_code": "max_uses_exceeded", "ms": 0,
+                     "message": f"the search limit of this request ({limit[c.name]}) is reached; answer now"}
+            elif not isinstance(query, str) or not query.strip():
+                r = {"ok": False, "error_code": "invalid_tool_input", "ms": 0, "message": "query must be a string"}
+            else:
+                uses[c.name] += 1
+                box = {}
+
+                def work(box=box, query=query, spec=spec):
+                    box["r"] = websearch.search(settings, query, spec.get("allowed_domains"),
+                                                spec.get("blocked_domains"))
+                worker = threading.Thread(target=work, daemon=True)
+                worker.start()
+                try:
+                    while worker.is_alive():
+                        worker.join(1.0)
+                        if worker.is_alive():
+                            yield "ping", None
+                except GeneratorExit:
+                    cancel.set()
+                    raise
+                r = box["r"]
+                print(f"[strata] web_search: {len(r.get('results') or [])} results in {r['ms'] / 1000:.1f} s"
+                      f"{'' if r['ok'] else ' (' + r['message'] + ')'}", flush=True)
+            results.append(websearch.model_text(r))
+            yield "web_search", {"event": "result", "id": c.id, "result": r}
+        if cancel.is_set():
+            done = {**done, "finish": "cancel"}
+            break
+        messages.append({"role": "assistant", "content": "".join(text).strip(),
+                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+        messages += [{"role": "tool", "content": r} for r in results]
+        try:
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
+        except ClientGone:
+            done = {**done, "finish": "cancel"}
+            break
+    yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids),
+                   "web_search_requests": sum(uses.values())}
+
+
 # ------------------------------------------------------------------------------------------------ OpenAI
 # The engine's last PP line stops short of the prompt: up to `--short-read` tokens (generate.cpp's `short_read`, 64 by
 # default) are read through the verify windows instead of the batched path, so the batched path never reports the whole
@@ -6431,7 +6517,7 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -6442,9 +6528,28 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    if run is None:
+        run = svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True)
+    for kind, x in run:
         if kind == "ping":
             yield None
+            continue
+        if kind == "web_search":                   # run_with_web_search: the server's own call and its results
+            if open_kind is not None:
+                yield close()
+                open_kind = None
+            index += 1
+            sid = "srvtoolu_" + x["id"].removeprefix("call_")
+            if x["event"] == "call":
+                yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+                    "type": "server_tool_use", "id": sid, "name": x["name"], "input": {}}}
+                yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                    "type": "input_json_delta", "partial_json": json.dumps(x["input"], ensure_ascii=False)}}
+            else:
+                yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+                    "type": "web_search_tool_result", "tool_use_id": sid,
+                    "content": websearch.block_content(x["result"])}}
+            yield close()
             continue
         if kind == "event":
             ev: Event = x
@@ -6491,11 +6596,15 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts (message_start could only say the whole prompt): what was read now stays for the next
             # request, a cache write; input_tokens keeps the last token, as 0 makes Claude Code count the prompt twice (#1013)
-            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
-            read_now = len(ids) - reused
+            prompt = x.get("prompt_tokens", len(ids))
+            reused = max(0, min(x.get("reused") or 0, prompt - 1))
+            read_now = prompt - reused
+            usage = {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
+                     "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}
+            if "web_search_requests" in x:
+                usage["server_tool_use"] = {"web_search_requests": x["web_search_requests"]}
             delta_event = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
-                           "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
-                                     "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+                           "usage": usage}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             yield "message_delta", delta_event
@@ -7920,7 +8029,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = max_req = int(req.get("max_tokens") or 0)        # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
@@ -7928,7 +8037,11 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            specs = {t["name"]: t for t in req.get("tools") or [] if websearch.is_server_tool(t)} \
+                if svc.web_search and tools else {}
+            run = run_with_web_search(svc, specs, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                      force) if specs else None
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -8907,6 +9020,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
+    web_search = websearch.settings_from(cfg)
+    if a.offline and web_search is not None:
+        ap.error("--offline requires web_search to be disabled in this profile")
     if a.offline:
         # The same decision, reported through the policy module so the two cannot drift: a profile
         # that permits a network source is refused here rather than on its first request.
@@ -9042,6 +9158,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             svc.vision = _dsp
             print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; --vision off turns them off)", flush=True)
     svc.offline = a.offline
+    svc.web_search = web_search
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)

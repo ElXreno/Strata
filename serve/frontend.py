@@ -28,6 +28,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve import websearch
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -218,13 +220,14 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking",
+                                             "server_tool_use", "web_search_tool_result")
 
 
 def _check_parts(content, path: str, kinds):
     """A request's content parts (on chat) or content blocks (on messages), looked at while the request is converted.
     A part whose type this server does not read (a file, audio, a document, Anthropic's tool_reference,
-    search_result, server_tool_use / web_search_tool_result blocks, ...) is left out of the prompt exactly as it always
+    search_result, ...) is left out of the prompt exactly as it always
     was, with a debug line: real clients (Claude Code, Codex, opencode, Cline, Continue, Open WebUI) send such parts
     next to text the model can answer from, so refusing them would break requests that work.  A "refusal" part is read
     as its text, as /v1/responses does.  Content that is not a list, and a part that is not an object, passes through
@@ -675,8 +678,19 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
-            elif kind == "tool_use":
+            elif kind in ("tool_use", "server_tool_use"):
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+            elif kind == "web_search_tool_result":
+                # the search the server ran inside this turn: the call so far, then its result, then the rest
+                if text or calls or reasoning:
+                    out = {"role": m["role"], "content": "".join(text)}
+                    if reasoning:
+                        out["reasoning_content"] = "".join(reasoning)
+                    if calls:
+                        out["tool_calls"] = calls
+                    messages.append(out)
+                    text, reasoning, calls, parts = [], [], [], []
+                messages.append({"role": "tool", "content": websearch.from_block(block.get("content"))})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
@@ -690,7 +704,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
-    tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+    tools = [{"name": t["name"], "description": websearch.DESCRIPTION, "parameters": websearch.SCHEMA}
+             if websearch.is_server_tool(t) else
+             {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
