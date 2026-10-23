@@ -1872,7 +1872,7 @@ private:
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
-                          uint64_t& digest, std::string& err) {
+                          uint64_t& digest, std::string& err, bool update = false) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
@@ -1934,7 +1934,8 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    if (update ? !strata::kernels::cvec_update(dir, s, err)
+               : !strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
     {
         strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
         b.i64("mode", o.cvec_mode);
@@ -12135,6 +12136,29 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
+            // CVEC <file>:<scale>: swap the loaded control vector's directions and scales in place (same mode and
+            // range as at start); the sessions read with the old one are dropped.  Answers CVECOK or CVECERR <reason>.
+            if (line.rfind("CVEC ", 0) == 0) {
+                Options o2 = o;
+                o2.cvec_files.clear();
+                const std::string spec = line.substr(5);
+                const size_t colon = spec.rfind(':');
+                o2.cvec_files.push_back({spec.substr(0, colon), colon == std::string::npos ? 1.0f : std::strtof(spec.c_str() + colon + 1, nullptr)});
+                std::string summary, cerr;
+                uint64_t digest = 0;
+                if (!strata::kernels::cvec().loaded() || !load_control_vectors(o2, g, summary, digest, cerr, true)) {
+                    std::printf("CVECERR %s\n", cerr.empty() ? "no control vector loaded at start" : cerr.c_str());
+                } else {
+                    cvec_digest = digest;
+                    live_ok = false;
+                    checks.clear();
+                    conversations.clear();
+                    std::fprintf(stderr, "strata serve: control vector swapped: %s\n", summary.c_str());
+                    std::printf("CVECOK %s\n", summary.c_str());
+                }
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
