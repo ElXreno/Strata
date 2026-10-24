@@ -1093,6 +1093,14 @@ each chunk prints how many ring entries it copied and how many it dropped. On an
 Swift IQ3_XXS pack at the release defaults, 23% fewer experts were streamed for a 2K prompt and 4% fewer at 32K (8,192-token
 chunks); a 1,790-token follow-up read on an 18.8K-token conversation took 18% less time and fresh 2K, 4K and 32K reads ran
 20%, 8% and 5% faster (4 pairs), with byte-identical replies in a deterministic lane at 1K to 32K.
+`STRATA_SELECT_TWO_PASS=1` (opt-in; sm_80+, the prompt path's tensor-core block scorer): every block is scored once in
+single-pass TF32 with a per-block error bound, and again in the usual 3xTF32 only where the bound reaches the query's top-k
+cut-off (a query the bound cannot settle has its 16-query tile scored again in full), so the selected cells, their order and
+the ties are exactly the 3xTF32 scorer's (the bound and the rule: `include/strata/kernels/qsa_two_pass.hpp`). On an RTX 3090
+(sm_86, PCIe 3.0, 250 W; the release defaults, 2 pairs of 2 runs) a 256K prompt read 5.2% faster (1,887 to 1,984 tokens/s), a
+128K prompt 2.2% faster and a 32K prompt the same within 1%; decode and the answers did not change. Calls whose last query has
+`STRATA_SELECT_TWO_PASS_MIN` blocks or more take it (default 4096, 16K cells). `STRATA_SELECT_TWO_PASS_CHECK=1` (a slow
+diagnostic) runs the 3xTF32 scorer beside it and prints, after each prompt, the queries whose ids differ (must be 0).
 
 ### RTX 20 (Turing, sm_75) kernels (opt-in)
 
