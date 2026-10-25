@@ -136,6 +136,32 @@ bool no_temp(const fs::path& dir) {
     return true;
 }
 
+std::vector<SessionKvSource> kv_sources(const SavedConversation& s) {
+    std::vector<SessionKvSource> sources;
+    for (const auto& k : s.kv) {
+        SessionKvSource src;
+        src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+        src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+        const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t i = 0; i < 5; ++i) src.sizes[i] = parts[i]->size();
+        src.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+        sources.push_back(std::move(src));
+    }
+    return sources;
+}
+
+SessionSaveSources save_sources(const SavedConversation& s) {
+    SessionSaveSources save;
+    save.meta.geometry = s.geometry;
+    save.meta.layer_lo = s.layer_lo; save.meta.layer_hi = s.layer_hi;
+    save.meta.cvec = s.cvec;
+    save.meta.live.ids = s.live.ids; save.meta.live.imgs = s.live.imgs; save.meta.live.used = s.live.used;
+    save.state = session_state_source(s.live);
+    for (const auto& c : s.checkpoints) save.checkpoints.push_back(&c);
+    save.kv = kv_sources(s);
+    return save;
+}
+
 bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expect = nullptr,
              const SessionReadLimits& limits = {}) {
     SavedConversation out;
@@ -358,6 +384,52 @@ int main() {
         // K/V in the image and as sources at once is ambiguous: refused
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
+    }
+    // running state and checkpoints streamed too (SessionSaveSources): the same bytes
+    {
+        const SessionSaveSources save = save_sources(original);
+        const fs::path p = dir / "stream-all.bin";
+        check(session_file_write(p.string(), save, id, written, error), "stream all: write succeeds");
+        check(slurp(p) == image, "stream all: byte-identical to the captured image (format v1)");
+        std::vector<std::array<size_t, 3>> asked;
+        SessionSaveSources traced = save;
+        traced.state.read = [&asked, inner = save.state.read](size_t part, size_t offset, void* dst, size_t n) {
+            asked.push_back({part, offset, n});
+            return inner(part, offset, dst, n);
+        };
+        check(session_file_write(p.string(), traced, id, written, error) && slurp(p) == image, "stream all: traced write");
+        std::array<size_t, 5> seen{};
+        bool contiguous = !asked.empty();
+        for (const auto& a : asked) {
+            contiguous = contiguous && a[0] < 5 && a[1] == seen[a[0]] && a[2] <= (16u << 20);
+            if (a[0] < 5) seen[a[0]] += a[2];
+        }
+        bool whole = true;
+        for (size_t i = 0; i < 5; ++i) whole = whole && seen[i] == save.state.sizes[i];
+        check(contiguous && whole, "stream all: every running-state part read once, in order, a block at most");
+        const fs::path q = dir / "stream-broken.bin";
+        SessionSaveSources broken = save;
+        broken.state.read = [](size_t, size_t, void*, size_t) { return false; };
+        broken.state.error = [] { return std::string("device gone"); };
+        check(!session_file_write(q.string(), broken, id, written, error) &&
+              error.find("running-state source read: device gone") != std::string::npos,
+              "stream all: a failing state source fails the write and is named");
+        check(!fs::exists(q) && no_temp(dir), "stream all: the failed write leaves no file");
+        SessionSaveSources twice = save;
+        twice.meta.live.gdn = {1};
+        check(!session_file_write(q.string(), twice, id, written, error) && !fs::exists(q),
+              "stream all: a running state given twice is refused");
+        SessionSaveSources missing = save;
+        missing.checkpoints.push_back(nullptr);
+        check(!session_file_write(q.string(), missing, id, written, error) && !fs::exists(q),
+              "stream all: a missing checkpoint is refused");
+        ConversationCheckpoint split = checkpoint(10, 9);
+        split.stage_parts.push_back(checkpoint(1, 9));
+        SessionSaveSources layered = save;
+        layered.checkpoints = {&split};
+        check(!session_file_write(q.string(), layered, id, written, error) &&
+              error.find("layer-split") != std::string::npos && !fs::exists(q) && no_temp(dir),
+              "stream all: layer-split state refused");
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
@@ -643,6 +715,96 @@ int main() {
         const fs::path p = dir / "flip.bin"; spit(p, d);
         check(!session_file_read_streamed(p.string(), id, meta, n, error), "streamed: a corrupted byte refused");
     }
+    // S2: the live running state stays on disk too: read pass, K/V pass, then the state pass
+    {
+        SessionReadLimits lim;
+        lim.max_tokens = 1000; lim.max_checkpoints = 2; lim.max_kv_layers = 3;
+        lim.max_state_bytes = {4099, 77, 301, 64, 8};
+        uint64_t asked = 0;
+        lim.admit = [&](uint64_t need, std::string&) { asked = need; return true; };
+        SavedConversation meta;
+        SessionStreamLayout layout;
+        size_t n = 0;
+        check(session_file_read_streamed(good.string(), id, meta, n, error, lim, layout) && n == image.size(),
+              "state stream: read succeeds");
+        check(asked == session_read_stream_peak_bytes(image.size(), lim, false) &&
+              asked + 4099 + 77 + 301 + 64 + 8 == session_read_stream_peak_bytes(image.size(), lim),
+              "state stream: the preflight holds no live running state");
+        check(meta.live.ids == original.live.ids && meta.live.imgs == original.live.imgs &&
+              meta.live.used == original.live.used && meta.live.gdn.empty() && meta.live.ple.empty() &&
+              meta.live.tails.empty() && meta.live.dead.empty() && meta.live.block_pos.empty(),
+              "state stream: the live tokens kept, its running state not");
+        bool kept = meta.checkpoints.size() == original.checkpoints.size();
+        for (size_t i = 0; kept && i < meta.checkpoints.size(); ++i)
+            kept = same_checkpoint(meta.checkpoints[i], original.checkpoints[i]);
+        check(kept, "state stream: the checkpoints kept");
+        check(layout.live_state == std::array<uint64_t, 5>{4099, 77, 301, 64, 8} && layout.kv.size() == original.kv.size(),
+              "state stream: the sizes recorded");
+        std::vector<std::vector<uint8_t>> part(original.kv.size() * 5);
+        check(session_file_apply_streamed(good.string(), id,
+              [&](size_t layer, size_t slot, uint64_t offset, const void* data, size_t len) {
+                  std::vector<uint8_t>& out = part[layer * 5 + slot];
+                  if (offset != out.size()) return false;
+                  const uint8_t* q = static_cast<const uint8_t*>(data);
+                  out.insert(out.end(), q, q + len);
+                  return true;
+              }, layout, error), "state stream: the K/V pass succeeds");
+        bool kv_same = true;
+        for (size_t i = 0; i < original.kv.size(); ++i) {
+            const ConversationBuffer* bufs[5] = {&original.kv[i].k, &original.kv[i].v, &original.kv[i].k_scale,
+                                                 &original.kv[i].v_scale, &original.kv[i].pooled};
+            for (size_t p2 = 0; p2 < 5; ++p2) {
+                std::vector<uint8_t> want(bufs[p2]->size());
+                kv_same = kv_same && bufs[p2]->read(want.data(), 0, want.size()) && want == part[i * 5 + p2];
+            }
+        }
+        check(kv_same, "state stream: the applied K/V equals the image byte for byte");
+        std::array<std::vector<uint8_t>, 5> state;
+        check(session_file_apply_state_streamed(good.string(), id,
+              [&](size_t slot, uint64_t offset, const void* data, size_t len) {
+                  if (slot >= 5 || offset != state[slot].size() || len > (16u << 20)) return false;
+                  const uint8_t* q = static_cast<const uint8_t*>(data);
+                  state[slot].insert(state[slot].end(), q, q + len);
+                  return true;
+              }, layout, error), "state stream: the state pass succeeds");
+        check(state[0] == original.live.gdn && state[1] == original.live.ple && state[2] == original.live.tails &&
+              state[3] == original.live.dead && state[4] == original.live.block_pos,
+              "state stream: the applied running state equals the image");
+        {
+            auto d = image;
+            d[64 + 21 * 8 + 8 + 1000 * 4 + 8 + 16 + 8 + 100] ^= 0x20;   // inside the live GDN state
+            const fs::path p = dir / "state-changed.bin"; spit(p, d);
+            check(!session_file_apply_streamed(p.string(), id,
+                  [](size_t, size_t, uint64_t, const void*, size_t) { return true; }, layout, error) &&
+                  error.find("changed") != std::string::npos, "state stream: the K/V pass refuses a changed state");
+            size_t calls = 0;
+            check(!session_file_apply_state_streamed(p.string(), id,
+                  [&](size_t, uint64_t, const void*, size_t) { ++calls; return true; }, layout, error) &&
+                  calls > 0 && error.find("running-state checksum") != std::string::npos,
+                  "state stream: the state pass refuses it after its blocks");
+        }
+        {
+            SavedConversation other = original;
+            other.live.gdn.pop_back();
+            const fs::path p = dir / "state-size.bin";
+            size_t w2 = 0;
+            check(session_file_write(p.string(), other, id, w2, error), "state stream: other-size write");
+            size_t kv_calls = 0, state_calls = 0;
+            check(!session_file_apply_streamed(p.string(), id,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++kv_calls; return true; }, layout, error) &&
+                  kv_calls == 0 && error.find("running-state part size") != std::string::npos,
+                  "state stream: the K/V pass refuses another state size before any block");
+            check(!session_file_apply_state_streamed(p.string(), id,
+                  [&](size_t, uint64_t, const void*, size_t) { ++state_calls; return true; }, layout, error) &&
+                  state_calls == 0 && error.find("running-state part size") != std::string::npos,
+                  "state stream: the state pass refuses it before any block");
+        }
+        check(!session_file_apply_state_streamed(good.string(), id,
+              [](size_t, uint64_t, const void*, size_t) { return false; }, layout, error) && !error.empty(),
+              "state stream: a failing sink fails the state pass");
+        check(!session_file_read_streamed(good.string(), {id.model, id.config ^ 1}, meta, n, error, lim, layout) &&
+              error.find("config") != std::string::npos, "state stream: another configuration refused");
+    }
     // R3/R5: injected failures at each write step - kind, publication and the old file
     {
         const fs::path p = dir / "fault.bin";
@@ -820,6 +982,33 @@ int main() {
         check(fat[0].gdn.size() == (256u << 20) && fat[0].gdn[12345] == 0x22 &&
               slurp(old_file) == std::vector<char>(9, 'o'), "save: live state and the old file intact");
 #endif
+    }
+    // A2: the streamed SAVE's preflight: the buffers and the token lists only
+    {
+        std::vector<ConversationCheckpoint> chain;
+        chain.push_back(checkpoint(10, 2));
+        chain.push_back(checkpoint(700, 3));
+        chain.back().gdn.assign(8u << 20, 0x11);
+        SessionSaveLive live;
+        live.state_bytes = 5000; live.tokens = 1000; live.images = 1; live.kv_layers = 13;
+        const uint64_t need = session_save_stream_peak_bytes(live);
+        check(need == (16u << 20) + (1u << 20) + 1000 * 4 + 16 + 13 * (sizeof(SessionKvSource) + 256),
+              "stream save: the write buffer, the small vectors, the token lists and the source directory");
+        SessionSaveLive huge = live;
+        huge.state_bytes = UINT64_MAX;
+        check(session_save_stream_peak_bytes(huge) == need && need < session_save_peak_bytes(&chain[1], live),
+              "stream save: neither the running state nor the checkpoint enters the peak");
+        std::vector<const ConversationCheckpoint*> out{&chain[0]};
+        std::string why;
+        uint64_t asked = 0;
+        const auto refuse = [&](uint64_t n, std::string& w) { asked = n; w = "low RAM"; return false; };
+        check(!session_save_stream_checkpoints(chain, live, refuse, out, why) && out.empty() && asked == need &&
+              why == "low RAM", "stream save: refused before anything is chosen");
+        const auto agree = [](uint64_t, std::string&) { return true; };
+        check(session_save_stream_checkpoints(chain, live, agree, out, why) && out.size() == 1 && out[0] == &chain[1],
+              "stream save: the deepest checkpoint, by reference");
+        check(session_save_stream_checkpoints({}, live, agree, out, why) && out.empty(),
+              "stream save: no checkpoints, none chosen");
     }
     // Opt-in pressure reclamation does not change the selected file bytes, even with pin=N.
     for (bool pin : {false, true}) {
