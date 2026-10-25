@@ -93,6 +93,7 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
         error = "unknown spill sidecar magic or version"; return false;
     }
     if (model != identity_.model || config != identity_.config) { error = "sidecar names another fingerprint"; return false; }
+    entry.identity = {model, config};
     uint64_t cvec = 0;
     if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
     entry.cvec = cvec != 0;
@@ -120,7 +121,7 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         if (!out) { error = "cannot create spill sidecar"; return false; }
         MetaWriter w(out);
-        if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(identity_.model) || !w.u64(identity_.config) ||
+        if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(entry.identity.model) || !w.u64(entry.identity.config) ||
             !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
         }
@@ -260,6 +261,7 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
     Entry entry;
     entry.stem = stem;
     entry.file_bytes = file_bytes;
+    entry.identity = identity_;
     entry.prefix = prefix;
     entry.cvec = cvec;
     entry.live_meta.ids = live.ids;
@@ -340,7 +342,7 @@ bool ConversationSpillCache::spill_streamed(const SessionSaveSources& save, size
 bool ConversationSpillCache::has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                                         bool cvec) const {
     for (const Entry& e : entries_)
-        if (e.prefix && e.cvec == cvec && e.live_meta.ids == ids && e.live_meta.imgs == images) return true;
+        if (e.prefix && current(e) && e.cvec == cvec && e.live_meta.ids == ids && e.live_meta.imgs == images) return true;
     return false;
 }
 
@@ -398,7 +400,7 @@ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
         bool held = same_saved_prefix(deepest, ids, images);
         for (const auto& checkpoint : checkpoints)
             if (!held && same_saved_prefix(deepest, checkpoint.ids, checkpoint.imgs)) held = true;
-        if (!entry.prefix && entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_ &&
+        if (!entry.prefix && current(entry) && entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_ &&
             (keep.empty() || entry.session_path() != keep)) {
             std::error_code ec;
             std::filesystem::remove(entry.session_path(), ec);
