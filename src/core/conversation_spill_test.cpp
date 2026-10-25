@@ -374,6 +374,70 @@ int main() {
         fs::remove_all(pdir);
     }
 
+    // CVEC: the digest is in the config fingerprint; a swap rebinds the tier to the new one
+    {
+        const fs::path vdir = fs::temp_directory_path() / ("strata-spill-cvec-test-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::remove_all(vdir);
+        const SessionFileIdentity old_vec{id.model, 0xaaaa}, new_vec{id.model, 0xbbbb};
+        auto meta_of = [](SavedConversation img) { img.kv.clear(); return img; };
+        auto sources_of = [](const SavedConversation& img) {
+            std::vector<SessionKvSource> sources;
+            for (const auto& k : img.kv) {
+                SessionKvSource src;
+                src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+                src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) src.sizes[i] = parts[i]->size();
+                src.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+                sources.push_back(std::move(src));
+            }
+            return sources;
+        };
+        ConversationSpillCache sp;
+        check(sp.open(vdir / "swap", old_vec, 1ull << 30, error), "cvec: open under the old vector");
+        const SavedConversation conv = sample(1000);
+        check(sp.spill(conv, error), "cvec: a conversation saved under the old vector");
+        const uint64_t one_file = sp.bytes();
+        SavedConversation root = sample(600);
+        root.checkpoints.clear();
+        root.checkpoints.push_back(checkpoint(600, 7));
+        size_t written = 0;
+        check(sp.spill_streamed(meta_of(root), sources_of(root), written, error, true, true), "cvec: a prefix under it");
+        std::vector<int32_t> next = conv.live.ids;
+        next.push_back(7777);
+        const auto before = sp.best(next, {}, false, 0.0, 0);
+        check(bool(before) && sp.has_prefix(root.live.ids, {}, false), "cvec: both match under their own vector");
+        const uint64_t bytes_before = sp.bytes();
+        sp.rebind(new_vec);
+        check(!sp.best(next, {}, false, 0.0, 0), "cvec: after the swap the old vector's file is not matched");
+        check(!sp.has_prefix(root.live.ids, {}, false), "cvec: nor does its prefix dedupe the new vector's");
+        SavedConversation back;
+        check(!sp.load(before.path, back, {}, error) && error.find("config") != std::string::npos,
+              "cvec: and it is never read under the new vector");
+        check(sp.drop_superseded(conv.live.ids, {}, conv.checkpoints, conv.cvec) == 0,
+              "cvec: the new vector's copies do not supersede the old vector's");
+        check(sp.size() == 2 && sp.bytes() == bytes_before && fs::exists(before.path),
+              "cvec: the old vector's files stay on disk and count against the limit");
+        check(sp.spill(conv, error), "cvec: the same conversation saved under the new vector");
+        const auto fresh = sp.best(next, {}, false, 0.0, 0);
+        check(bool(fresh) && fresh.path != before.path && sp.load(fresh.path, back, {}, error),
+              "cvec: the new vector's own copy matches and reads");
+        sp.rebind(old_vec);
+        const auto again = sp.best(next, {}, false, 0.0, 0);
+        check(bool(again) && again.path == before.path && sp.has_prefix(root.live.ids, {}, false) &&
+              sp.load(again.path, back, {}, error), "cvec: swapping back finds the old vector's files again");
+        ConversationSpillCache aging;
+        check(aging.open(vdir / "aging", old_vec, 2 * one_file + one_file / 2, error) && aging.spill(conv, error),
+              "cvec: aging: one file under the old vector");
+        aging.rebind(new_vec);
+        check(aging.spill(conv, error) && aging.spill(conv, error) && aging.size() == 2 &&
+              aging.disk_evictions() == 1, "cvec: aging: the limit evicts the oldest, the old vector's file");
+        aging.rebind(old_vec);
+        check(!aging.best(next, {}, false, 0.0, 0), "cvec: aging: nothing of the old vector is left");
+        fs::remove_all(vdir);
+    }
+
     std::printf("conversation_spill_test: %d checks passed\n", checks);
     return 0;
 }
