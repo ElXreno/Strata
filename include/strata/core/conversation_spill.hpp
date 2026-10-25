@@ -35,6 +35,8 @@ public:
     // --kv-resident changing clears the whole old tier here, before it fills the disk under the limit.
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
               std::string& error);
+    // CVEC: files of another identity stay on disk, unmatched, until rebound to theirs or aged out
+    void rebind(SessionFileIdentity identity) { identity_ = identity; }
     bool enabled() const { return enabled_; }
     size_t size() const { return entries_.size(); }
     uint64_t bytes() const { return bytes_; }
@@ -51,6 +53,7 @@ public:
         int64_t best_tokens = 0;
         for (size_t i = entries_.size(); i-- > 0;) {
             const Entry& entry = entries_[i];
+            if (!current(entry)) continue;
             const ConversationMatch match = conversation_metadata_match(entry.live_meta,
                     entry.checkpoint_lengths, prompt, images, cvec, entry.cvec, similarity, n_min);
             if (match.tokens > best_tokens)
@@ -95,6 +98,7 @@ private:
     struct Entry {
         std::filesystem::path stem;          // "<dir>/strata-conv-<serial>" (both files share it)
         uint64_t file_bytes = 0;
+        SessionFileIdentity identity{};      // the one it was written under (the config carries the cvec digest)
         bool cvec = true;
         ConversationCheckpoint live_meta;    // ids + imgs only; no running state
         std::vector<size_t> checkpoint_lengths;
@@ -102,6 +106,9 @@ private:
         std::string session_path() const { return (stem.string() + ".sess"); }
         std::string meta_path() const { return (stem.string() + ".meta"); }
     };
+    bool current(const Entry& e) const {
+        return e.identity.model == identity_.model && e.identity.config == identity_.config;
+    }
     void enforce_budget();
     std::filesystem::path next_stem(bool prefix = false);
     bool index_written(const std::filesystem::path& stem, uint64_t file_bytes, const SavedConversation& meta,
