@@ -10,6 +10,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 namespace strata::core {
@@ -77,26 +78,107 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
     return true;
 }
 
+bool state_sizes_valid(size_t tokens, const std::vector<ConversationImageKey>& imgs,
+                       const std::array<uint64_t, 5>& sizes, const SessionState& ss, const ModelGeometry& g,
+                       std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, tokens, z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    if (sizes[0] != z.gdn || sizes[1] != (ss.ple_hist ? z.ple : 0) ||
+        sizes[2] != layers * z.tail || sizes[3] != layers * z.dead ||
+        sizes[4] != layers * z.block_pos || !image_keys(imgs, tokens))
+        return fail(error, "invalid checkpoint running-state payload");
+    return true;
+}
+
+bool live_validate(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                   const SessionState& ss, const ModelGeometry& g, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, ids.size(), z, error)) return false;
+    if (ids.empty() || !image_keys(images, ids.size()) ||
+        std::any_of(ids.begin(), ids.end(), [](int32_t id) { return id < 0; }))
+        return fail(error, "invalid live token/image metadata");
+    return true;
+}
+
+bool view_checkpoint(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
+                     const std::vector<ConversationImageKey>& images, const SessionState& ss,
+                     const ModelGeometry& g, std::string& error) {
+    if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > ids.size() ||
+        !std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
+        return fail(error, "checkpoint is not a live token prefix");
+    if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+    size_t image = 0;
+    for (const auto& key : images) {
+        if ((uint64_t) key.start >= c.ids.size()) break;
+        if (image >= c.imgs.size() || !(c.imgs[image++] == key))
+            return fail(error, "checkpoint image identity differs");
+    }
+    if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+    return true;
+}
+
 bool view_validate(const ConversationView& view, const SessionState& ss,
                    const ModelGeometry& g, std::string& error) {
-    ConversationStateSizes z;
-    if (!checkpoint_targets(ss, g, view.ids.size(), z, error)) return false;
-    if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
-        std::any_of(view.ids.begin(), view.ids.end(), [](int32_t id) { return id < 0; }))
-        return fail(error, "invalid live token/image metadata");
-    for (const auto& c : view.checkpoints) {
-        if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
-            !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
-            return fail(error, "checkpoint is not a live token prefix");
-        if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
-        size_t image = 0;
-        for (const auto& key : view.images) {
-            if ((uint64_t) key.start >= c.ids.size()) break;
-            if (image >= c.imgs.size() || !(c.imgs[image++] == key))
-                return fail(error, "checkpoint image identity differs");
-        }
-        if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+    if (!live_validate(view.ids, view.images, ss, g, error)) return false;
+    for (const auto& c : view.checkpoints)
+        if (!view_checkpoint(c, view.ids, view.images, ss, g, error)) return false;
+    return true;
+}
+
+bool stream_view_validate(const ConversationStreamView& view, const SessionState& ss,
+                          const ModelGeometry& g, std::string& error) {
+    if (!live_validate(view.ids, view.images, ss, g, error)) return false;
+    for (const ConversationCheckpoint* c : view.checkpoints) {
+        if (!c) return fail(error, "missing checkpoint");
+        if (!view_checkpoint(*c, view.ids, view.images, ss, g, error)) return false;
     }
+    return true;
+}
+
+bool state_source(SessionStateSource& out, const SessionState& ss, const ModelGeometry& g,
+                  const std::vector<int32_t>& ids, std::string& error) {
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, ids.size(), z, error)) return false;
+#if defined(STRATA_GPU_METAL)
+    auto held = std::make_shared<ConversationCheckpoint>();   // the decode window's state, captured whole
+    held->ids = ids;
+    if (!conversation_checkpoint_save(*held, ss, g, error)) return false;
+    SessionStateSource s = session_state_source(*held);
+    s.read = [held, read = std::move(s.read)](size_t part, size_t offset, void* dst, size_t n) {
+        return read(part, offset, dst, n);
+    };
+    out = std::move(s);
+    return true;
+#endif
+    const size_t layers = owned_qsa(ss);
+    std::array<std::vector<const uint8_t*>, 3> rows;   // tails, dead, block_pos per owned QSA layer
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        rows[0].push_back(reinterpret_cast<const uint8_t*>(st.idx_tail));
+        rows[1].push_back(reinterpret_cast<const uint8_t*>(st.idx_dead));
+        rows[2].push_back(reinterpret_cast<const uint8_t*>(st.idx_block_pos));
+    }
+    const std::array<const uint8_t*, 2> whole = {reinterpret_cast<const uint8_t*>(ss.gdn_state),
+                                                 reinterpret_cast<const uint8_t*>(ss.ple_hist)};
+    const std::array<size_t, 3> row = {z.tail, z.dead, z.block_pos};
+    SessionStateSource s;
+    s.sizes = {z.gdn, ss.ple_hist ? z.ple : 0, layers * z.tail, layers * z.dead, layers * z.block_pos};
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.read = [rows, whole, row, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "running-state read out of range"; return false; }
+        uint8_t* d = static_cast<uint8_t*>(dst);
+        if (part < 2) return copy(d, whole[part] + offset, n, *why);
+        while (n) {
+            const size_t r = row[part - 2], j = offset / r, within = offset % r, c = std::min(n, r - within);
+            if (!copy(d, rows[part - 2][j] + within, c, *why)) return false;
+            d += c; offset += c; n -= c;
+        }
+        return true;
+    };
+    s.error = [why] { return *why; };
+    out = std::move(s);
     return true;
 }
 
@@ -148,14 +230,9 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, 
 
 bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error) {
-    ConversationStateSizes z;
-    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
-    const size_t layers = owned_qsa(ss);
-    if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
-        c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
-        c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
-        return fail(error, "invalid checkpoint running-state payload");
-    return true;
+    return state_sizes_valid(c.ids.size(), c.imgs,
+                             {c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()}, ss, g,
+                             error);
 }
 
 #if defined(STRATA_GPU_METAL)
@@ -642,6 +719,90 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_snapshot_stream(SessionSaveSources& save, const ConversationStreamView& view,
+                                  const SessionState& ss, const ModelGeometry& g, const QsaState& draft,
+                                  std::string& error) {
+    if (!stream_view_validate(view, ss, g, error) || !sync(error)) return false;
+    SessionSaveSources out;
+    out.meta.geometry = geometry_key(g);
+    out.meta.layer_lo = ss.layer_lo; out.meta.layer_hi = ss.layer_hi;
+    out.meta.live.ids = view.ids; out.meta.live.imgs = view.images;
+    out.meta.cvec = view.cvec;
+    out.checkpoints = view.checkpoints;
+    if (!state_source(out.state, ss, g, view.ids, error)) return false;
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss);
+    out.kv.resize(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    if (!conversation_kv_source(out.kv.back(), draft, g, upto, false, error)) return false;
+    save = std::move(out);
+    return true;
+}
+
+bool conversation_state_target(const SavedConversation& image, const std::array<uint64_t, 5>& sizes,
+                               SessionState& ss, const ModelGeometry& g, ConversationStateTarget& target,
+                               std::string& error) {
+    if (!state_sizes_valid(image.live.ids.size(), image.live.imgs, sizes, ss, g, error)) return false;
+    ConversationStateTarget t;
+    t.session = &ss; t.geometry = &g; t.sizes = sizes; t.tokens = (int64_t) image.live.ids.size();
+#if defined(STRATA_GPU_METAL)
+    t.staged = std::make_shared<ConversationCheckpoint>();
+    const std::array<std::vector<uint8_t>*, 5> parts = {&t.staged->gdn, &t.staged->ple, &t.staged->tails,
+                                                        &t.staged->dead, &t.staged->block_pos};
+    for (size_t i = 0; i < parts.size(); ++i) parts[i]->resize((size_t) sizes[i]);
+#endif
+    target = std::move(t);
+    return true;
+}
+
+bool ConversationStateTarget::apply(size_t part, uint64_t offset, const void* data, size_t n,
+                                    std::string& error) const {
+    if (!session || !geometry || part >= 5 || offset > sizes[part] || n > sizes[part] - offset)
+        return fail(error, "running-state block outside its part");
+    if (!n) return true;
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    if (staged) {
+        const std::array<std::vector<uint8_t>*, 5> parts = {&staged->gdn, &staged->ple, &staged->tails,
+                                                            &staged->dead, &staged->block_pos};
+        if (parts[part]->size() != sizes[part]) return fail(error, "running-state staging size differs");
+        std::memcpy(parts[part]->data() + offset, src, n);
+        return true;
+    }
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(*geometry, *session, z, error)) return false;
+    if (part == 0) return copy(reinterpret_cast<uint8_t*>(session->gdn_state) + offset, src, n, error);
+    if (part == 1) return copy(reinterpret_cast<uint8_t*>(session->ple_hist) + offset, src, n, error);
+    const size_t r = part == 2 ? z.tail : part == 3 ? z.dead : z.block_pos;
+    const size_t pooled_row = (size_t) tokens / strata::kernels::qsa_real_shapes().idx_block;
+    while (n) {
+        const size_t j = (size_t) (offset / r), within = (size_t) (offset % r), c = std::min(n, r - within);
+        const auto& st = owned(*session, j);
+        uint8_t* dst = part == 2 ? reinterpret_cast<uint8_t*>(st.idx_tail)
+                     : part == 3 ? reinterpret_cast<uint8_t*>(st.idx_dead)
+                                 : reinterpret_cast<uint8_t*>(st.idx_block_pos);
+        if (!copy(dst + within, src, c, error)) return false;
+        // as conversation_checkpoint_restore: the saved `dead` row is the pooled row the next token fills
+        if (part == 3 && tokens > 0 &&
+            !copy(reinterpret_cast<uint8_t*>(st.idx_pooled + pooled_row * geometry->idx_key_dim) + within, src, c,
+                  error)) return false;
+        src += c; offset += c; n -= c;
+    }
+    return true;
+}
+
+bool ConversationStateTarget::finish(const std::vector<int32_t>& ids, std::string& error) const {
+    if (!session || !geometry || (int64_t) ids.size() != tokens) return fail(error, "unbound running-state target");
+    if (staged) {
+        staged->ids = ids;
+        return conversation_checkpoint_restore(*staged, *session, *geometry, error);
+    }
+    const size_t n = ids.size();
+    session->ple_prev[0] = n >= 2 ? ids[n - 2] : -1;
+    session->ple_prev[1] = n >= 1 ? ids[n - 1] : -1;
+    return sync(error);
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {
@@ -673,8 +834,9 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     return true;
 }
 
-bool conversation_snapshot_validate_meta(const SavedConversation& image, const SessionState& ss,
-                                         const ModelGeometry& g, const QsaState* draft, std::string& error) {
+namespace {
+bool meta_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                   const QsaState* draft, const std::array<uint64_t, 5>* live_state, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -682,13 +844,34 @@ bool conversation_snapshot_validate_meta(const SavedConversation& image, const S
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
-    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
+    if (!view_validate(view, ss, g, error)) return false;
+    if (live_state) {
+        const auto& l = image.live;
+        if (!l.gdn.empty() || !l.ple.empty() || !l.tails.empty() || !l.dead.empty() || !l.block_pos.empty())
+            return fail(error, "the live running state is both in the image and on disk");
+        if (!state_sizes_valid(l.ids.size(), l.imgs, *live_state, ss, g, error)) return false;
+    } else if (!conversation_checkpoint_validate(image.live, ss, g, error)) {
+        return false;
+    }
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate_meta(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
     return !draft || conversation_kv_validate_meta(image.kv.back(), *draft, g, upto, false, error);
+}
+} // namespace
+
+bool conversation_snapshot_validate_meta(const SavedConversation& image, const SessionState& ss,
+                                         const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    return meta_validate(image, ss, g, draft, nullptr, error);
+}
+
+bool conversation_snapshot_validate_stream(const SavedConversation& image, const std::array<uint64_t, 5>& live_state,
+                                           const SessionState& ss, const ModelGeometry& g, const QsaState& draft,
+                                           std::string& error) {
+    if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
+    return meta_validate(image, ss, g, &draft, &live_state, error);
 }
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,

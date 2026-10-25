@@ -3,12 +3,19 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 // GNU/ELF link wrapping exercises the actual restore control flow without
@@ -116,6 +123,25 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
     check(conversation_snapshot_validate(image, ss, g, draft.st, error), "complete image validates without CUDA");
+    {
+        SavedConversation on_disk = image;
+        const std::array<uint64_t, 5> live_state = {image.live.gdn.size(), image.live.ple.size(),
+                                                    image.live.tails.size(), image.live.dead.size(),
+                                                    image.live.block_pos.size()};
+        on_disk.live.gdn.clear(); on_disk.live.ple.clear(); on_disk.live.tails.clear();
+        on_disk.live.dead.clear(); on_disk.live.block_pos.clear();
+        check(conversation_snapshot_validate_stream(on_disk, live_state, ss, g, draft.st, error),
+              "an image whose running state stayed on disk validates by its sizes");
+        auto wrong = live_state;
+        wrong[0] -= 1;
+        ConversationStateTarget target;
+        check(!conversation_snapshot_validate_stream(on_disk, wrong, ss, g, draft.st, error) &&
+              !conversation_state_target(on_disk, wrong, ss, g, target, error), "another running-state size refused");
+        check(!conversation_snapshot_validate_stream(image, live_state, ss, g, draft.st, error),
+              "a running state both in the image and on disk refused");
+        check(conversation_state_target(on_disk, live_state, ss, g, target, error) && target.sizes == live_state,
+              "running-state target bound without CUDA");
+    }
     size_t estimate = 0;
     check(conversation_snapshot_bytes({image.live.ids,image.live.imgs,image.checkpoints,true},ss,g,draft.st,estimate,error),
           "capture estimate works without CUDA");
@@ -238,6 +264,67 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    {
+        reset();
+        auto pattern = [](std::vector<uint8_t>& v, uint8_t salt) {
+            for (size_t i = 0; i < v.size(); ++i) v[i] = uint8_t(salt + i * 7 + i / 251);
+        };
+        pattern(gdn, 1); pattern(history, 2);
+        for (auto* p : {&first,&last,&draft}) for (size_t k = 0; k < p->data.size(); ++k) pattern(p->data[k], uint8_t(10 + k));
+        for (auto* p : {&first,&last}) std::memcpy(p->data[4].data() + 2 * g.idx_key_dim * 4, p->data[6].data(), p->data[6].size());
+        SavedConversation want;
+        check(conversation_snapshot_save(want,view,ss,g,draft.st,error), "stream fixture: captured reference");
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / ("strata-transfer-test-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        auto slurp = [](const fs::path& p) { std::ifstream f(p, std::ios::binary);
+            return std::vector<char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); };
+        const SessionFileIdentity id{1, 2};
+        const fs::path streamed = dir / "streamed.bin", captured = dir / "captured.bin";
+        size_t n = 0;
+        copy_calls = 0; copied_bytes = 0;
+        const ConversationStreamView sview{image.live.ids,image.live.imgs,{&image.checkpoints[0]},true};
+        SessionSaveSources save;
+        check(conversation_snapshot_stream(save,sview,ss,g,draft.st,error) && copy_calls == 0,
+              "stream save: sources bound, nothing copied yet");
+        check(session_file_write(streamed.string(),save,id,n,error) && session_file_write(captured.string(),want,id,n,error),
+              "stream save: both files written");
+        check(slurp(streamed) == slurp(captured), "stream save: byte-identical to the captured image's file");
+        size_t moved = want.live.gdn.size() + want.live.ple.size() + want.live.tails.size() + want.live.dead.size() +
+                       want.live.block_pos.size();
+        for (const auto& k : want.kv) moved += k.k.size() + k.v.size() + k.k_scale.size() + k.v_scale.size() + k.pooled.size();
+        check(copied_bytes == moved, "stream save: every state and K/V byte moved once, straight into the file");
+        reset();
+        SavedConversation meta;
+        SessionStreamLayout layout;
+        check(session_file_read_streamed(streamed.string(),id,meta,n,error,{},layout) &&
+              conversation_snapshot_validate_stream(meta,layout.live_state,ss,g,draft.st,error), "stream restore: read pass");
+        std::vector<ConversationKvTarget> targets;
+        ConversationStateTarget state;
+        check(conversation_kv_targets(meta,ss,g,draft.st,targets,error) &&
+              conversation_state_target(meta,layout.live_state,ss,g,state,error) && unchanged(),
+              "stream restore: targets bound, nothing written");
+        check(session_file_apply_streamed(streamed.string(),id,[&](size_t l,size_t part,uint64_t off,const void* d,size_t len) {
+                  return l < targets.size() && targets[l].apply(part,off,d,len,error); },layout,error),
+              "stream restore: K/V pass");
+        for (auto& t : targets) check(t.finish(error), "stream restore: K/V residency");
+        check(gdn != want.live.gdn, "stream restore: the running state waits for its own pass");
+        check(session_file_apply_state_streamed(streamed.string(),id,[&](size_t part,uint64_t off,const void* d,size_t len) {
+                  return state.apply(part,off,d,len,error); },layout,error) && state.finish(meta.live.ids,error),
+              "stream restore: state pass");
+        SavedConversation back;
+        check(conversation_snapshot_save(back,view,ss,g,draft.st,error), "stream restore: captured back");
+        bool same = back.live.gdn == want.live.gdn && back.live.ple == want.live.ple &&
+                    back.live.tails == want.live.tails && back.live.dead == want.live.dead &&
+                    back.live.block_pos == want.live.block_pos && back.kv.size() == want.kv.size();
+        for (size_t i = 0; same && i < want.kv.size(); ++i)
+            same = back.kv[i].k == want.kv[i].k && back.kv[i].v == want.kv[i].v && back.kv[i].k_scale == want.kv[i].k_scale &&
+                   back.kv[i].v_scale == want.kv[i].v_scale && back.kv[i].pooled == want.kv[i].pooled;
+        check(same && ss.ple_prev[0] == 8 && ss.ple_prev[1] == 9, "stream restore: byte-identical session, PLE window set");
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
 #endif
 }
 }
