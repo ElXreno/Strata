@@ -255,6 +255,26 @@ int main() {
         check(str_dir.spill_streamed(meta, make_sources(c), written, error), "streamed: streamed spill");
         check(written > 0 && str_dir.bytes() == written, "streamed: size accounted");
         check(slurp(img_dir.newest_path()) == slurp(str_dir.newest_path()), "streamed: file equals the image spill's");
+        {
+            ConversationSpillCache all_dir;
+            check(all_dir.open(sdir / "all", id, 1ull << 30, error), "streamed: open the stream-all dir");
+            SessionSaveSources save;
+            save.meta.geometry = c.geometry;
+            save.meta.layer_lo = c.layer_lo; save.meta.layer_hi = c.layer_hi; save.meta.cvec = c.cvec;
+            save.meta.live.ids = c.live.ids; save.meta.live.imgs = c.live.imgs; save.meta.live.used = c.live.used;
+            save.state = session_state_source(c.live);
+            for (const auto& k : c.checkpoints) save.checkpoints.push_back(&k);
+            save.kv = make_sources(c);
+            size_t all_bytes = 0;
+            check(all_dir.spill_streamed(save, all_bytes, error) && all_bytes == written &&
+                  slurp(all_dir.newest_path()) == slurp(img_dir.newest_path()),
+                  "streamed: running state and checkpoints streamed too, the same file");
+            std::vector<int32_t> resume = c.live.ids;
+            resume.push_back(7);
+            const auto all_hit = all_dir.best(resume, {}, c.cvec, 0.0, 0);
+            check(bool(all_hit) && all_hit.tokens == (int64_t) c.live.ids.size() && all_hit.live,
+                  "streamed: indexed like the image spill");
+        }
         // it matches and reads back like any spilled conversation
         std::vector<int32_t> next_prompt = c.live.ids;
         next_prompt.push_back(7);

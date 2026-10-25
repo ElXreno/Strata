@@ -663,9 +663,9 @@ stays unread. A disk hit is read into host RAM first, so it must fit the RAM cac
 `--layer-split`.
 
 With `--conversation-cache-disk-only` a conversation that loses the engine is written the way a session save writes it, the
-K/V streamed from the pools into the file, and read back the way a streaming restore reads it: a read pass checks the whole
-file before the GPU state changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools
-16 MiB at a time. The new file is written before older copies are removed, `--conversation-cache-disk-mib` is the only size
+running state, the deepest checkpoint and the K/V streamed into the file 16 MiB at a time with no copy in RAM, and read back
+the way a streaming restore reads it: a read pass checks the whole file before the GPU state changes (a bad file is dropped
+and the prompt is read as usual), then the K/V and the running state go into the session 16 MiB at a time. The new file is written before older copies are removed, `--conversation-cache-disk-mib` is the only size
 limit, the next turn of the same conversation writes nothing, and a clean shutdown saves the live conversation. It also keeps
 **prefix entries** (`strata-conv-prefix-N`): a conversation's shared opening (the deepest `"strata_prefix"` checkpoint, else
 the root) is saved once on its own, so a new conversation that opens the same way, such as a coding agent's next session,
@@ -695,9 +695,10 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
-- A restore does not hold the K/V in RAM: a first pass validates the whole file, a second copies the K/V into the engine's pools
-  16 MiB at a time, so a session larger than RAM restores. The second pass must see the sizes and payload hash the first saw;
-  a difference found after its first block ends the engine, so the file must have no writer but this engine.
+- A save or restore holds neither the K/V nor the live running state in RAM: a restore's first pass validates the whole file
+  and keeps only the checkpoints, a second copies the K/V into the engine's pools 16 MiB at a time and a third copies the
+  running state the same way, so a session larger than RAM restores. The later passes must see the sizes and hashes the first
+  saw; a difference found after the first applied block ends the engine, so the file must have no writer but this engine.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what
   the cells mean (engine version, CUDA or HIP, `--kv`, `STRATA_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the
   rope configuration, a loaded control vector and the arithmetic switches). Sampling, seeds, draft tuning and the expert
