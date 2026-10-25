@@ -73,6 +73,9 @@ public:
     // removes them and the disk budget evicts every ordinary conversation before one of them.
     bool spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, size_t& bytes,
                         std::string& error, bool durable = false, bool prefix = false);
+    // the same with the running state and the checkpoints streamed too (no host copy)
+    bool spill_streamed(const SessionSaveSources& save, size_t& bytes, std::string& error, bool durable = false,
+                        bool prefix = false);
     // A prefix entry holding exactly these tokens (and images) is on disk already.
     bool has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
     size_t prefix_count() const;
@@ -103,6 +106,9 @@ private:
     std::filesystem::path next_stem(bool prefix = false);
     bool index_written(const std::filesystem::path& stem, uint64_t file_bytes, const SavedConversation& meta,
                        std::string& error, bool prefix = false);
+    bool index_written(const std::filesystem::path& stem, uint64_t file_bytes, bool cvec,
+                       const ConversationCheckpoint& live, const std::vector<size_t>& checkpoint_lengths,
+                       std::string& error, bool prefix);
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, std::string& error) const;
     bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
 
