@@ -16,11 +16,10 @@ struct SessionSaveReclaimed {
 // Preserve every explicit pin and exactly the checkpoint the file would have selected.
 template<class Probe>
 SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& chain,
-                                        ConversationCache& cache, const SessionSaveLive& live,
+                                        ConversationCache& cache, uint64_t need,
                                         uint64_t floor, Probe available) {
     SessionSaveReclaimed out;
     const auto* selected = session_deepest_checkpoint(chain);
-    const uint64_t need = session_save_peak_bytes(selected, live);
     auto room = available();
     auto done = [&] { return !room || need == UINT64_MAX || conversation_memory_admit(room, need, floor); };
     if (done()) return out;
@@ -50,6 +49,14 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
         if (done()) break;
     }
     return out;
+}
+
+template<class Probe>
+SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& chain,
+                                        ConversationCache& cache, const SessionSaveLive& live,
+                                        uint64_t floor, Probe available) {
+    return session_save_reclaim(chain, cache, session_save_peak_bytes(session_deepest_checkpoint(chain), live),
+                                floor, available);
 }
 
 } // namespace strata::core

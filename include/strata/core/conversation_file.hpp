@@ -179,6 +179,25 @@ bool session_file_write(const std::string& path, const SavedConversation& meta, 
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
 
+// parts 0..4 = gdn, ple, tails, dead, block_pos, read in place like SessionKvSource
+struct SessionStateSource {
+    std::array<size_t, 5> sizes{};
+    std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
+    std::function<std::string()> error;
+};
+SessionStateSource session_state_source(const ConversationCheckpoint& checkpoint);
+
+// format v1 bytes of the captured image; the checkpoints stay unchanged until written
+struct SessionSaveSources {
+    SavedConversation meta;
+    SessionStateSource state;
+    std::vector<const ConversationCheckpoint*> checkpoints;
+    std::vector<SessionKvSource> kv;
+};
+bool session_file_write(const std::string& path, const SessionSaveSources& save, const SessionFileIdentity& id,
+                        size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                        SessionStatus* status = nullptr);
+
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
 std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vector<ConversationCheckpoint>& chain);
@@ -201,6 +220,10 @@ uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const Se
 bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, const SessionSaveLive& live,
                               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
                               std::vector<ConversationCheckpoint>& out, std::string& why);
+uint64_t session_save_stream_peak_bytes(const SessionSaveLive& live);
+bool session_save_stream_checkpoints(const std::vector<ConversationCheckpoint>& chain, const SessionSaveLive& live,
+                                     const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
+                                     std::vector<const ConversationCheckpoint*>& out, std::string& why);
 
 // What a read checks before it allocates.  Every count is checked against the bytes left in the payload and against
 // these limits BEFORE its array is allocated; the defaults accept whatever the payload can hold.  The engine sets all
@@ -261,7 +284,24 @@ bool session_file_apply_streamed(const std::string& path, const SessionFileIdent
                                  SessionStatus* status = nullptr);
 // The RAM preflight of the streaming read of a `file_bytes` file: the two block buffers, the small vectors and the
 // running-state metadata the limits admit; the K/V itself stays on disk.
-uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, bool live_state = true);
+
+// live running state on disk too: read pass, K/V apply pass, then the state pass (past the gate)
+struct SessionStreamLayout {
+    std::array<uint64_t, 5> live_state{};
+    uint64_t live_hash = 0;
+    std::vector<std::array<uint64_t, 5>> kv;
+};
+using SessionStateBlock = std::function<bool(size_t part, uint64_t offset, const void* data, size_t n)>;
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
+                                size_t& bytes, std::string& error, const SessionReadLimits& limits,
+                                SessionStreamLayout& layout, SessionStatus* status = nullptr);
+bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
+                                 const SessionStreamLayout& layout, std::string& error,
+                                 SessionStatus* status = nullptr);
+bool session_file_apply_state_streamed(const std::string& path, const SessionFileIdentity& id,
+                                       const SessionStateBlock& sink, const SessionStreamLayout& layout,
+                                       std::string& error, SessionStatus* status = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

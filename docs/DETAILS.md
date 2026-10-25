@@ -1350,7 +1350,8 @@ limit: with `--layer-split` the disk tier stays off.
 **The conversation cache on disk only (`--conversation-cache-disk-only`).** With `--conversation-cache-spill-dir DIR`
 and this flag, the conversation cache needs no RAM budget (`--conversation-cache-mib` is not used). When a request
 switches to another conversation, the outgoing one is written to DIR the way a session SAVE writes it: the running
-state and the deepest checkpoint are copied, the K/V is streamed from its pools into the file. When a conversation
+state, the deepest checkpoint and the K/V are streamed from where they are into the file, 16 MiB at a time, with no
+copy in RAM. When a conversation
 comes back, it is read the way a streaming RESTORE reads it: a read pass checks the whole file before anything on the
 GPU changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools 16 MiB at a
 time. The new file is written before the conversation's older copies are removed, so a failed write loses nothing,
@@ -1489,9 +1490,12 @@ two 16 MiB block buffers and the small vectors) fits in RAM above the parking
 floor (`--conversation-cache-min-free-mib`), the file's size against the largest this session can restore, the
 geometry and layer range before any state array, and every count against the bytes left and this session's exact
 limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, and the payload hash
-- all before any device write, and a refusal leaves the current session as it was. The K/V itself is not held in RAM:
+- all before any device write, and a refusal leaves the current session as it was. Neither the K/V nor the live
+running state is held in RAM (the read pass hashes and sizes the running state, and keeps the checkpoints):
 after the running state and the K/V headers were validated against this engine, the engine reads the file again and
-copies the K/V into its pools a 16 MiB block at a time; this is what restores a session larger than RAM. The apply
+copies the K/V into its pools a 16 MiB block at a time; this is what restores a session larger than RAM. Then it reads
+the beginning of the file a third time and copies the running state into the session the same way, checking the hash
+of everything up to its end against the read pass. The apply
 pass is bound to the read pass: a file whose K/V layer count or any part size differs from what the read pass saw is
 refused before that layer or part is applied, and the payload hash is recomputed and compared to the file's trailer
 at the end. The first applied block is the gate - everything before it can still be refused cleanly; a divergence

@@ -174,6 +174,42 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        {
+            const ConversationStreamView sview{ids,images,{&checkpoints[0]},true};
+            SessionSaveSources save;
+            check(conversation_snapshot_stream(save,sview,ss,g,draft.state,err),"stream-all save sources");
+            check(save.meta.live.gdn.empty() && save.meta.checkpoints.empty() && save.checkpoints.size()==1 &&
+                  save.checkpoints[0]==&checkpoints[0] && save.kv.size()==b.kv.size(),"nothing captured on the host");
+            const std::string p3=(dir/"stream-all.bin").string();
+            size_t n3=0;
+            check(session_file_write(p3,save,id,n3,err) && slurp(p3)==slurp(p2),"stream-all file equals the captured file");
+            fill(201);
+            SavedConversation smeta;
+            SessionStreamLayout layout;
+            check(session_file_read_streamed(p3,id,smeta,n3,err,{},layout),"stream-all read pass");
+            check(conversation_snapshot_validate_stream(smeta,layout.live_state,ss,g,draft.state,err),"stream-all validate");
+            std::vector<ConversationKvTarget> targets;
+            ConversationStateTarget state;
+            check(conversation_kv_targets(smeta,ss,g,draft.state,targets,err) &&
+                  conversation_state_target(smeta,layout.live_state,ss,g,state,err),"stream-all targets");
+            cuda_check(cudaDeviceSynchronize());
+            check(session_file_apply_streamed(p3,id,[&](size_t l,size_t part,uint64_t off,const void* d,size_t len){
+                      return l<targets.size() && targets[l].apply(part,off,d,len,err); },layout,err),"stream-all K/V pass");
+            for (auto& t : targets) check(t.finish(err),"stream-all K/V residency");
+            check(session_file_apply_state_streamed(p3,id,[&](size_t part,uint64_t off,const void* d,size_t len){
+                      return state.apply(part,off,d,len,err); },layout,err) && state.finish(smeta.live.ids,err),
+                  "stream-all state pass");
+            SavedConversation back;
+            check(conversation_snapshot_save(back,view,ss,g,draft.state,err),"capture the stream-all restore");
+            check(back.live.gdn==b.live.gdn && back.live.ple==b.live.ple && back.live.tails==b.live.tails &&
+                  back.live.dead==b.live.dead && back.live.block_pos==b.live.block_pos &&
+                  equal(back.kv[0],b.kv[0]) && equal(back.kv.back(),b.kv.back()),"stream-all restore equals B");
+            check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"stream-all PLE token window");
+            std::vector<uint8_t> spare(sizes.dead);
+            cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled+(ids.size()/4)*g.idx_key_dim,sizes.dead,
+                                  cudaMemcpyDeviceToHost));
+            check(spare==b.live.dead,"stream-all spare pooled row from the saved dead row");
+        }
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};
