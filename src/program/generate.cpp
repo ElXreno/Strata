@@ -12314,7 +12314,7 @@ int main(int argc, char** argv) {
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             // CVEC <file>:<scale>: swap the loaded control vector's directions and scales in place (same mode and
-            // range as at start); the sessions read with the old one are dropped.  Answers CVECOK or CVECERR <reason>.
+            // range as at start); old-vector RAM sessions go, its disk files stay unmatched.  CVECOK/CVECERR.
             if (line.rfind("CVEC ", 0) == 0) {
                 Options o2 = o;
                 o2.cvec_files.clear();
@@ -12330,6 +12330,29 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     checks.clear();
                     conversations.clear();
+                    for (BSlot& sl : bs)   // the slots' conversations were read with the old vector too, as after #879
+                        if (sl.active) {
+                            sl.tainted = true;
+                            if (slot_ckpt_move_env()) {
+                                if (ckpt_pool.on())
+                                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                                sl.checks.clear();
+                            }
+                        } else if (sl.cached) {
+                            sl.cached = false;
+                            sl.partial = false;
+                            sl.checks.clear();
+                        }
+                    config_fp.reset();   // the digest is in it: the next save and match are bound to the new vector
+                    if (conversation_spill.enabled()) {
+                        std::string ie;
+                        if (session_identity(spill_identity, ie, nullptr)) {
+                            conversation_spill.rebind(spill_identity);
+                        } else {
+                            std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", ie.c_str());
+                            conversation_spill = strata::core::ConversationSpillCache{};
+                        }
+                    }
                     std::fprintf(stderr, "strata serve: control vector swapped: %s\n", summary.c_str());
                     std::printf("CVECOK %s\n", summary.c_str());
                 }
