@@ -244,6 +244,16 @@ std::filesystem::path ConversationSpillCache::next_stem(bool prefix) {
 // The file at <stem>.sess is written: check it against the disk limit, write its sidecar and index it.
 bool ConversationSpillCache::index_written(const std::filesystem::path& stem, uint64_t file_bytes,
                                            const SavedConversation& meta, std::string& error, bool prefix) {
+    std::vector<size_t> lengths;
+    lengths.reserve(meta.checkpoints.size());
+    for (const auto& c : meta.checkpoints) lengths.push_back(c.ids.size());
+    return index_written(stem, file_bytes, meta.cvec, meta.live, lengths, error, prefix);
+}
+
+bool ConversationSpillCache::index_written(const std::filesystem::path& stem, uint64_t file_bytes, bool cvec,
+                                           const ConversationCheckpoint& live,
+                                           const std::vector<size_t>& checkpoint_lengths, std::string& error,
+                                           bool prefix) {
     std::error_code ec;
     const std::string session = stem.string() + ".sess";
     if (file_bytes > budget_) { std::filesystem::remove(session, ec); error = "snapshot exceeds the disk cache limit"; return false; }
@@ -251,11 +261,10 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
     entry.stem = stem;
     entry.file_bytes = file_bytes;
     entry.prefix = prefix;
-    entry.cvec = meta.cvec;
-    entry.live_meta.ids = meta.live.ids;
-    entry.live_meta.imgs = meta.live.imgs;
-    entry.checkpoint_lengths.reserve(meta.checkpoints.size());
-    for (const auto& c : meta.checkpoints) entry.checkpoint_lengths.push_back(c.ids.size());
+    entry.cvec = cvec;
+    entry.live_meta.ids = live.ids;
+    entry.live_meta.imgs = live.imgs;
+    entry.checkpoint_lengths = checkpoint_lengths;
     if (!write_sidecar(stem.string() + ".meta", entry, error)) { std::filesystem::remove(session, ec); return false; }
     try {
         entries_.push_back(std::move(entry));
@@ -303,6 +312,29 @@ bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const
         return false;
     }
     return index_written(stem, bytes, meta, error, prefix);
+}
+
+bool ConversationSpillCache::spill_streamed(const SessionSaveSources& save, size_t& bytes, std::string& error,
+                                            bool durable, bool prefix) {
+    bytes = 0;
+    if (!enabled_) return false;
+    if (save.meta.live.ids.empty() || !save.meta.stage_images.empty()) {
+        error = "a streamed spill needs a single-GPU conversation"; return false;
+    }
+    std::vector<size_t> lengths;
+    lengths.reserve(save.checkpoints.size());
+    for (const ConversationCheckpoint* c : save.checkpoints) lengths.push_back(c ? c->ids.size() : 0);
+    std::error_code ec;
+    const std::filesystem::path stem = next_stem(prefix);
+    const std::string session = stem.string() + ".sess";
+    SessionWriteOptions wo;
+    wo.durable = durable;
+    SessionStatus st;
+    if (!session_file_write(session, save, identity_, bytes, error, wo, &st)) {
+        std::filesystem::remove(session, ec);
+        return false;
+    }
+    return index_written(stem, bytes, save.meta.cvec, save.meta.live, lengths, error, prefix);
 }
 
 bool ConversationSpillCache::has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,

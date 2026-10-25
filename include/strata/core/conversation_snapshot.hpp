@@ -5,7 +5,10 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <array>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -162,6 +165,32 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+struct ConversationStreamView {
+    const std::vector<int32_t>& ids;
+    const std::vector<ConversationImageKey>& images;
+    std::vector<const ConversationCheckpoint*> checkpoints;
+    bool cvec;
+};
+// no host copy; synchronizes, then the session and the checkpoints stay untouched until written
+bool conversation_snapshot_stream(SessionSaveSources& save, const ConversationStreamView& view,
+                                  const SessionState& session, const ModelGeometry& g, const QsaState& draft,
+                                  std::string& error);
+// the live running state of a SessionStreamLayout restore, applied after the K/V targets finished
+struct ConversationStateTarget {
+    SessionState* session = nullptr;
+    const ModelGeometry* geometry = nullptr;
+    std::array<uint64_t, 5> sizes{};
+    int64_t tokens = 0;
+    std::shared_ptr<ConversationCheckpoint> staged;   // Metal: gathered for the decode window
+    bool apply(size_t part, uint64_t offset, const void* data, size_t n, std::string& error) const;
+    bool finish(const std::vector<int32_t>& ids, std::string& error) const;
+};
+bool conversation_state_target(const SavedConversation& image, const std::array<uint64_t, 5>& sizes,
+                               SessionState& session, const ModelGeometry& g, ConversationStateTarget& target,
+                               std::string& error);
+bool conversation_snapshot_validate_stream(const SavedConversation& image, const std::array<uint64_t, 5>& live_state,
+                                           const SessionState& session, const ModelGeometry& g,
+                                           const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
