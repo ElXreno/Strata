@@ -47,6 +47,7 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -3459,6 +3460,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const char* v = std::getenv("STRATA_PREFILL_ISSUER");
             return v == nullptr || std::atoi(v) != 0;
         }();
+        // STRATA_PREFILL_ROUTED_STREAM=1 (opt-in, routed_stream.hpp): the issuer keeps at most a few copies queued
+        // ahead of the link (STRATA_PREFILL_ROUTED_STREAM_DEPTH, default 16), each layer's routing is published once
+        // its router has run (host grouping below), and an entry not yet issued that no token of the chunk routes to
+        // is dropped.  Routed entries are copied as below, into the same slots: the same bits.  The threaded issuer
+        // on one GPU only (no peer prompt ring); unset, nothing here runs and the loop below is the walk.  Declared
+        // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
+        static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"));
+        static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
+        static const int copy_event_every = [] {
+            const char* v = std::getenv("STRATA_PREFILL_COPY_EVENT_EVERY");
+            return strata::prefill::copy_event_every_from(v ? std::atoi(v) : 1);
+        }();
+        const bool rs_want = rs_env && stream_all && issuer_on && !m.pp;
+        const bool rs_on = rs_want && copy_event_every <= 1;   // (sparse copied events: the plain walk)
+        routed_stream::RouteGate rs_gate;
+        size_t rs_dropped = 0;
+        if (rs_want && !rs_on) {
+            if (static bool said = false; !said) {
+                said = true;
+                std::fprintf(stderr, "strata: STRATA_PREFILL_ROUTED_STREAM is off: STRATA_PREFILL_COPY_EVENT_EVERY > 1 "
+                                     "copies every expert\n");
+            }
+        }
+        if (rs_on) {
+            rs_gate.reset(g.n_layers, (int32_t) m.g->n_expert);
+            if (static bool said = false; !said) {
+                said = true;
+                std::fprintf(stderr, "strata: STRATA_PREFILL_ROUTED_STREAM=1: a streamed prompt chunk drops the experts no token "
+                                     "routes to before they are copied (at most %d copies queued ahead of the link)\n", rs_depth);
+            }
+        }
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
@@ -3478,10 +3510,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // after the one it needs (the copy stream is in order).  STRATA_PREFILL_COPY_WAIT_DEDUPE=1 skips the copy
         // stream's wait on a slot's release event when the previous slot was released by the same event (one flush).
         // The same copies into the same slots: the same bytes.
-        static const int copy_event_every = [] {
-            const char* v = std::getenv("STRATA_PREFILL_COPY_EVENT_EVERY");
-            return strata::prefill::copy_event_every_from(v ? std::atoi(v) : 1);
-        }();
         static const bool copy_wait_dedupe = [] {
             const char* v = std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE");
             return v != nullptr && std::atoi(v) != 0;
@@ -3493,7 +3521,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 said = true;
                 std::fprintf(stderr, "strata: prompt copies: a copied event every %d streamed experts "
                                      "(STRATA_PREFILL_COPY_EVENT_EVERY), %s (STRATA_PREFILL_COPY_WAIT_DEDUPE)\n",
-                             copy_event_every, copy_wait_dedupe ? "one wait per release event" : "a wait per slot");
+                             copy_event_every, !copy_wait_dedupe ? "a wait per slot"
+                                 : rs_on ? "a wait per slot: the routed walk issues out of order"
+                                         : "one wait per release event");
             }
         }
         std::vector<std::atomic<int64_t>> rec_of(sparse_copied ? (size_t) m.ring : 0);   // the entry a slot's event marks
@@ -3515,6 +3545,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 };
                 // before the issuer waits: what it issued is covered, so no consumer waits on an entry with no event
                 auto cover = [&](size_t idx) { if (sparse_copied && idx > 0 && last_rec < (int64_t) idx - 1) record(idx - 1); };
+                if (rs_on) {
+                    auto ops = routed_stream::make_ops(
+                        [&] { return a_consumed.load(std::memory_order_acquire); },
+                        [&] { return a_stop.load(std::memory_order_acquire); },
+                        [&](int sl) { return cudaEventQuery(m.copied[sl]) != cudaErrorNotReady; },
+                        [](const StreamEntry& en) { return en.job < 0; },
+                        [&](size_t idx, int sl) {   // the copy of the loop below, unchanged
+                            const StreamEntry& en = seq[idx];
+                            const auto th = Clock::now();
+                            const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                            if (en.job < 0) {
+                                cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                                ++iss_dma;
+                            } else {
+                                const uint8_t* hb = m.stager->wait(en.job);
+                                cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                                m.stager->issued_one(en.job, m.copy);
+                            }
+                            cudaEventRecord(m.copied[sl], m.copy);
+                            m.stage_live[sl] = true;
+                            iss_ms += ms_since(th);
+                            ++iss_streamed;
+                        },
+                        [] { std::this_thread::yield(); });
+                    rs_dropped = routed_stream::issue_walk(seq, (size_t) m.ring, rs_depth, rs_gate, a_issued, ops).dropped;
+                    return;
+                }
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         cover(idx);
@@ -4447,6 +4505,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        // STRATA_PREFILL_ROUTED_STREAM: this layer's routing to the issuer (it drops the unrouted entries
+                        // it has not issued yet; the walk below gives every unrouted entry back without reading it)
+                        if (rs_on) rs_gate.publish(l, m.cnt.data());
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                             int64_t nstream = 0;
@@ -5612,9 +5673,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
-            if (copy_wait_dedupe && pt.on)
+            if (copy_wait_dedupe && !rs_on && pt.on)
                 std::fprintf(stderr, "strata prefill copies: %lld slot waits, %lld skipped as the same release event\n",
                              (long long) iss_waits, (long long) iss_dedup);
+            if (rs_on && std::getenv("STRATA_TRACE")) {
+                std::fprintf(stderr, "strata trace: routed stream: chunk from token %lld (%lld tokens): %lld of %zu ring entries "
+                                     "copied, %zu dropped (no token routes to them), depth %d\n", (long long) p0, (long long) T,
+                             (long long) iss_streamed, seq.size(), rs_dropped, rs_depth);
+                std::fflush(stderr);
+            }
         }
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
