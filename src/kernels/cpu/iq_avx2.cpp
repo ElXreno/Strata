@@ -44,6 +44,15 @@
 #else
 #define STRATA_AVXVNNI_FN
 #endif
+#if defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#define STRATA_BMI2_FN __attribute__((target("bmi2")))
+#define STRATA_AVXVNNI_BMI2_FN __attribute__((target("avxvnni,bmi2")))
+#else
+#include <intrin.h>
+#define STRATA_BMI2_FN
+#define STRATA_AVXVNNI_BMI2_FN
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -52,6 +61,43 @@ inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si1
 inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+
+// STRATA_IQ1S_PDEP=0/1 forces the index form; AMD and Hygon before family 0x19 microcode pdep
+struct Iq1sCpu {
+    bool bmi2 = false, pdep = false;
+};
+const Iq1sCpu& iq1s_cpu() {
+    static const Iq1sCpu c = [] {
+        Iq1sCpu r;
+        unsigned v[4] = {0, 0, 0, 0};
+        auto cpuid = [&v](unsigned leaf) {
+#if defined(__GNUC__) || defined(__clang__)
+            __cpuid_count(leaf, 0, v[0], v[1], v[2], v[3]);
+#else
+            int x[4];
+            __cpuidex(x, (int) leaf, 0);
+            for (int i = 0; i < 4; ++i) v[i] = (unsigned) x[i];
+#endif
+        };
+        cpuid(0);
+        if (v[0] < 7) return r;
+        char vendor[13];
+        std::memcpy(vendor, &v[1], 4);
+        std::memcpy(vendor + 4, &v[3], 4);
+        std::memcpy(vendor + 8, &v[2], 4);
+        vendor[12] = 0;
+        cpuid(1);
+        const unsigned base = (v[0] >> 8) & 0xF, family = base == 0xF ? base + ((v[0] >> 20) & 0xFF) : base;
+        cpuid(7);
+        r.bmi2 = ((v[1] >> 8) & 1u) != 0;
+        const bool slow = (std::strcmp(vendor, "AuthenticAMD") == 0 || std::strcmp(vendor, "HygonGenuine") == 0) &&
+                          family < 0x19;
+        const char* e = std::getenv("STRATA_IQ1S_PDEP");
+        r.pdep = r.bmi2 && (e != nullptr ? std::atoi(e) != 0 : !slow);
+        return r;
+    }();
+    return c;
+}
 
 // 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.
 inline __m256i sgn_vec(uint32_t m) {
@@ -371,12 +417,14 @@ template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 
 namespace plain {
 #define STRATA_ROWS_VNNI 0
 #define STRATA_ROWS_FN
+#define STRATA_ROWS_BMI2_FN STRATA_BMI2_FN
 #include "iq_avx2_rows.inl"
 }  // namespace plain
 #if STRATA_AVXVNNI
 namespace vnni {
 #define STRATA_ROWS_VNNI 1
 #define STRATA_ROWS_FN STRATA_AVXVNNI_FN
+#define STRATA_ROWS_BMI2_FN STRATA_AVXVNNI_BMI2_FN
 #include "iq_avx2_rows.inl"
 }  // namespace vnni
 #endif
@@ -535,7 +583,10 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     iq256_rows_v(iq256_variant(), type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
-bool iq256x_supported(int type) noexcept { return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29; }
+bool iq256x_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || (type == 19 && iq1s_cpu().bmi2) || type == 21 || type == 22 ||
+           type == 29;
+}
 
 void iq256x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
