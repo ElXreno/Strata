@@ -144,7 +144,9 @@ std::vector<std::vector<int>> node_cores() {
     return nodes;
 }
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+void* node_map(size_t bytes, int node, int n_nodes, bool thp = true) {
+    return os::anon_alloc(bytes, node, n_nodes, thp);
+}
 void pin_self(int cpu) { os::pin_self(cpu); }
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
@@ -4370,6 +4372,19 @@ struct Model::Impl {
         copy_spare.assign(L.size(), -1);
         cp_base.assign(L.size(), nullptr);
         cp_cnt.assign(L.size(), 0);
+        // huge pages only while free 2 MiB blocks cover the copies with room: past that every fault of
+        // a MADV_HUGEPAGE mapping compacts (DS4_ANON_THP=0/1 forces)
+        uint64_t copy_b = 0;
+        for (const Layer& l : L) {
+            const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0);
+            copy_b += (uint64_t) ns * cp_lay[(size_t) l.il][3] * (uint64_t) NH;
+        }
+        const char* thp_env = std::getenv("DS4_ANON_THP");
+        const uint64_t huge_free = os::free_huge_bytes();
+        const bool copy_thp = thp_env != nullptr ? std::atoi(thp_env) != 0 : huge_free / 5 * 4 >= copy_b;
+        if (o.verbose || !copy_thp)
+            std::fprintf(stderr, "ds4: the copies (%.1f GB) on %s pages (%.1f GB of free 2 MiB blocks)\n", copy_b / 1e9,
+                         copy_thp ? "huge" : "4 KB", huge_free == ~uint64_t{0} ? -1.0 : huge_free / 1e9);
         for (Layer& l : L) {
             l.ram.assign((size_t) l.n_exp, -1);
             const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0);
@@ -4378,7 +4393,7 @@ struct Model::Impl {
             std::array<uint8_t*, 2> base = {nullptr, nullptr};
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
-                base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, copy_thp);
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
                     ram_chunks.push_back(base[(size_t) X]);
@@ -4419,23 +4434,41 @@ struct Model::Impl {
         std::atomic<bool> bad{false};
         std::atomic<int64_t> done_b{0};
         std::vector<std::thread> th;
+        // unbuffered reads through a bounce buffer: the page cache would fill the RAM the copies need
+        // (DS4_COPY_DIRECT=0: buffered, as before)
+        static const bool direct =
+            std::getenv("DS4_COPY_DIRECT") == nullptr || std::atoi(std::getenv("DS4_COPY_DIRECT")) != 0;
+        size_t bounce_b = 0;
+        for (const Layer& l : L)
+            for (int r = 0; r < 3; ++r) bounce_b = std::max(bounce_b, (size_t) (mx_n(r) / NH) * mx_row_b(l, r));
+        bounce_b = (bounce_b + 3 * os::kDirectAlign) & ~(size_t) (os::kDirectAlign - 1);
         for (int t = 0; t < 12 && !jobs.empty(); ++t)
             th.emplace_back([&] {
+                uint8_t* bounce = direct ? (uint8_t*) std::aligned_alloc(os::kDirectAlign, bounce_b) : nullptr;
                 for (size_t i; (i = ji.fetch_add(1)) < jobs.size() && !bad.load();) {
                     const Job& j = jobs[i];
                     const Layer& l = L[(size_t) j.layer];
                     for (int r = 0; r < 3; ++r) {
                         const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                        for (int X = 0; X < NH; ++X)
-                            if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb, nb,
-                                            ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
-                                bad.store(true);
+                        const int fi = l.mx_file[r];
+                        const os::fd_t df = (size_t) fi < pk.dfds.size() ? pk.dfds[(size_t) fi] : os::kBadFd;
+                        for (int X = 0; X < NH; ++X) {
+                            const uint64_t off = l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb;
+                            uint8_t* dst = ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                            if (bounce != nullptr && df != os::kBadFd && os::direct_span(off, nb) <= bounce_b &&
+                                os::pread_direct(df, bounce, nb, off)) {
+                                std::memcpy(dst, bounce + off % os::kDirectAlign, nb);
+                                continue;
+                            }
+                            if (!pk.read_at(fi, off, nb, dst)) bad.store(true);
+                        }
                     }
                     const int64_t db = done_b.fetch_add((int64_t) l.blob) + (int64_t) l.blob;
                     if (o.verbose && i % 2048 == 0)
                         std::fprintf(stderr, "ds4: copying experts %zu / %zu (%.1f GB, %.2f GB/s)\n", i, jobs.size(), db / 1e9,
                                      db / 1e6 / std::max(1.0, now_ms() - t0));
                 }
+                std::free(bounce);
             });
         for (auto& t : th) t.join();
         if (bad.load()) {
