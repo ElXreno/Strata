@@ -21,6 +21,13 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#if defined(__GNUC__) && defined(__x86_64__)
+#include <cpuid.h>
+#include <x86intrin.h>
+#include <cstdio>
+#include <cstdlib>
+#define STRATA_DS4_UMWAIT 1
+#endif
 
 namespace strata::ds4 {
 
@@ -31,6 +38,34 @@ inline void cpu_relax() {
     __builtin_ia32_pause();
 #endif
 }
+
+#if defined(STRATA_DS4_UMWAIT)
+inline uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
+        unsigned a = 0, b = 0, cx = 0, d = 0;
+        if (__get_cpuid_count(7, 0, &a, &b, &cx, &d) == 0 || ((cx >> 5) & 1u) == 0) {
+            std::fprintf(stderr, "ds4: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        std::fprintf(stderr, "ds4: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
+        return (uint64_t) std::atoll(e);
+    }();
+    return c;
+}
+inline unsigned umwait_state() {
+    static const unsigned s = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT_C02");
+        return e != nullptr && *e == '1' ? 0u : 1u;
+    }();
+    return s;
+}
+inline void umonitor(const void* p) { asm volatile("umonitor %0" : : "r"(p) : "memory"); }
+inline void umwait(unsigned state, uint64_t deadline) {
+    asm volatile("umwait %0" : : "r"(state), "d"((uint32_t) (deadline >> 32)), "a"((uint32_t) deadline) : "memory", "cc");
+}
+#endif
 
 class Pool {
 public:
@@ -95,6 +130,9 @@ private:
     }
     void loop() {
         uint64_t seen = gen_.load();
+#if defined(STRATA_DS4_UMWAIT)
+        const uint64_t um = umwait_cycles();
+#endif
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             uint32_t spins = 0;
@@ -102,8 +140,18 @@ private:
             for (;;) {
                 g = gen_.load(std::memory_order_acquire);
                 if (g != seen || quit_.load(std::memory_order_relaxed)) break;
-                cpu_relax();
-                if ((++spins & 1023u) != 0) continue;
+#if defined(STRATA_DS4_UMWAIT)
+                if (um != 0) {
+                    umonitor(&gen_);
+                    if (gen_.load(std::memory_order_acquire) != seen) continue;
+                    umwait(umwait_state(), __rdtsc() + um);
+                    if ((++spins & 15u) != 0) continue;
+                } else
+#endif
+                {
+                    cpu_relax();
+                    if ((++spins & 1023u) != 0) continue;
+                }
                 if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
                     std::unique_lock<std::mutex> lk(mu_);
                     sleeping_.fetch_add(1);
