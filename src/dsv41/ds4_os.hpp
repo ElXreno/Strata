@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -398,10 +399,38 @@ inline bool in_ram(const void* p, size_t n) {
 #endif
 }
 
+/// Free 2 MiB blocks now (/proc/buddyinfo orders 9 and up), bytes; ~0 where unknown
+inline uint64_t free_huge_bytes() {
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/buddyinfo", "r");
+    if (f == nullptr) return ~uint64_t{0};
+    uint64_t total = 0;
+    char line[512];
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        const char* q = std::strstr(line, "zone");
+        if (q == nullptr) continue;
+        q += 4;
+        while (*q == ' ') ++q;
+        while (*q != '\0' && *q != ' ') ++q;
+        for (int o = 0; o < 11; ++o) {
+            char* e = nullptr;
+            const unsigned long long v = std::strtoull(q, &e, 10);
+            if (e == q) break;
+            if (o >= 9) total += (uint64_t) v * (4096ull << o);
+            q = e;
+        }
+    }
+    std::fclose(f);
+    return total;
+#else
+    return ~uint64_t{0};
+#endif
+}
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
-/// pages where the OS gives them; nullptr if it cannot be had.
-inline void* anon_alloc(size_t bytes, int node, int nodes) {
+/// pages where the OS gives them (thp); nullptr if it cannot be had.
+inline void* anon_alloc(size_t bytes, int node, int nodes, bool thp = true) {
 #if defined(_WIN32)
+    (void) thp;
     if (node >= 0 && nodes > 1)
         return VirtualAllocExNuma(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
                                   (DWORD) node);
@@ -409,7 +438,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    madvise(m, bytes, MADV_HUGEPAGE);
+    if (thp) madvise(m, bytes, MADV_HUGEPAGE);
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
