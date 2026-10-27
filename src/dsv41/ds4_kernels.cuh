@@ -223,6 +223,8 @@ struct PfDev {
     unsigned long long* cnt = nullptr;    // [2][kPfSlots]: (seq << 32) | blocks done
     int* gl = nullptr;                    // [2][kPfSlots]: guessed experts by rank, -1 padded
     unsigned* gseq = nullptr;             // [2]: the seq gl is for (0 while written)
+    int* gld = nullptr;                   // device copies of gl, gseq (gl, gseq host-mapped for the
+    unsigned* gseqd = nullptr;            // copy engine's thread; the same pointers otherwise)
     uint8_t* buf = nullptr;               // [2][slots][stride]
     size_t stride = 0;
     int slots = 0;                        // staging slots a parity holds
@@ -235,6 +237,8 @@ struct PfAhead {
     unsigned* gseq = nullptr;
     unsigned seq = 0;
     int B = 0;
+    int* gld = nullptr;
+    unsigned* gseqd = nullptr;
 };
 struct PfMats {   // three matrices: offset in a RAM copy, in the staged blob, bytes
     size_t soff[3] = {0, 0, 0}, doff[3] = {0, 0, 0}, bytes[3] = {0, 0, 0};

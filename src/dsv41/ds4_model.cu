@@ -645,6 +645,7 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    x3::Mat la_w;              // learned lookahead for this layer's picks, Q8_0 (la_load; raw null: gate_w)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -1013,6 +1014,15 @@ struct Model::Impl {
         std::vector<std::pair<uint8_t*, size_t>> reg;
         int64_t win_late = 0, win_planned = 0, win_req = 0;
         int cap_max = 0, win_clean = 0;
+        // copy engine (default; DS4_PREFETCH_ENGINE=sm: the pull kernel): a host thread copies each list
+        const bool sm = std::getenv("DS4_PREFETCH_ENGINE") && std::strcmp(std::getenv("DS4_PREFETCH_ENGINE"), "sm") == 0;
+        const bool after_lane = env_i("DS4_PREFETCH_AFTER_LANE", 0) != 0;
+        unsigned* stamp = nullptr;   // pinned [kRing]: the ready stamps' source, seq at seq % kRing
+        std::atomic<int> tgt[kRing];   // seq % kRing -> the layer a list is for
+        std::vector<std::vector<unsigned long long>> htab;   // pf_tab on the host
+        std::thread mover;
+        std::atomic<bool> run{false}, gate{false}, busy{false};
+        std::atomic<int64_t> lists{0}, copies{0}, cancelled{0}, checked{0}, bad{0};
     } pf;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
@@ -1289,6 +1299,8 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
+        pf.run.store(false);
+        if (pf.mover.joinable()) pf.mover.join();
         if (pf.sB != nullptr) {
             cudaSetDevice(devs[0].id);
             cudaStreamSynchronize(pf.sB);
@@ -2849,6 +2861,7 @@ struct Model::Impl {
                 workers.back()->start();
             }
         calibrate_paths();
+        la_load();
         pf_init();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
@@ -6481,7 +6494,8 @@ struct Model::Impl {
     }
     void pf_refresh(const Layer& l) {
         if (l.pf_tab == nullptr) return;
-        const std::vector<unsigned long long> tab = pf_tab_build(l);
+        pf.htab[(size_t) l.il] = pf_tab_build(l);
+        const std::vector<unsigned long long>& tab = pf.htab[(size_t) l.il];
         cudaSetDevice(devs[0].id);
         cudaMemcpyAsync(l.pf_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice, devs[0].st);
     }
@@ -6540,12 +6554,79 @@ struct Model::Impl {
         size_t n = 0;
         for (Layer& l : L) {
             if (l.pf_tab == nullptr || !pf.pinned[(size_t) l.il]) continue;
-            const std::vector<unsigned long long> tab = pf_tab_build(l);
+            pf.htab[(size_t) l.il] = pf_tab_build(l);
+            const std::vector<unsigned long long>& tab = pf.htab[(size_t) l.il];
             for (unsigned long long v : tab) n += v != 0;
             cudaMemcpy(l.pf_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice);
         }
         std::fprintf(stderr, "ds4: prefetch: pinned %.1f of %.1f GB in %.1f s, %zu experts pullable\n", (double) got.load() / 1e9,
                      (double) all.load() / 1e9, (now_ms() - t0) / 1000.0, n);
+    }
+    // learned lookahead weights (DS4_LOOKAHEAD_W=file, else <pack>/lookahead.bin): DS4LA001, n x
+    // (u32 layer, NE x D F32), held as Q8_0 for the lookahead's GEMV instead of the next layer's gate
+    void la_load() {
+        const char* env = std::getenv("DS4_LOOKAHEAD_W");
+        if (env != nullptr && *env == '\0') return;
+        const std::string path = env != nullptr ? env : o.pack + "/lookahead.bin";
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) {
+            if (env != nullptr) std::fprintf(stderr, "ds4: lookahead weights %s: cannot open\n", path.c_str());
+            return;
+        }
+        char magic[8];
+        uint32_t hd[3] = {0, 0, 0};
+        bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, "DS4LA001", 8) == 0 && std::fread(hd, 4, 3, f) == 3;
+        const int n = (int) hd[0], ne = (int) hd[1], dd = (int) hd[2];
+        ok = ok && dd == g.dim && dd % 32 == 0 && ne > 0 && ne <= 1024;
+        const size_t rb = (size_t) dd / 32 * gg::kQ8Bytes;
+        std::vector<float> w;
+        std::vector<uint8_t> q;
+        size_t vram = 0;
+        int got = 0;
+        for (int i = 0; ok && i < n; ++i) {
+            uint32_t li = 0;
+            w.resize((size_t) ne * dd);
+            ok = std::fread(&li, 4, 1, f) == 1 && std::fread(w.data(), 4, w.size(), f) == w.size();
+            if (!ok || li >= L.size()) break;
+            Layer& l = L[li];
+            if (l.mtp || l.n_exp != ne || l.gate_w == nullptr) continue;
+            q.assign((size_t) ne * rb, 0);
+            for (int r = 0; r < ne; ++r)
+                for (int b = 0; b < dd / 32; ++b) {   // ggml's quantize_row_q8_0
+                    const float* x = w.data() + (size_t) r * dd + (size_t) b * 32;
+                    float amax = 0.0f;
+                    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+                    const float sc = amax / 127.0f, id = sc > 0.0f ? 1.0f / sc : 0.0f;
+                    uint8_t* blk = q.data() + (size_t) r * rb + (size_t) b * gg::kQ8Bytes;
+                    const uint16_t h = strata::kernels::f16_from_f32(sc);
+                    std::memcpy(blk, &h, 2);
+                    for (int j = 0; j < 32; ++j) blk[2 + j] = (uint8_t) (int8_t) std::lrintf(x[j] * id);
+                }
+            Dev& dv = devs[(size_t) l.dev];
+            uint8_t* dp = nullptr;
+            std::string err;
+            if (!dalloc(dv, dp, q.size(), err)) {
+                ok = false;
+                break;
+            }
+            cudaSetDevice(dv.id);
+            if (cudaMemcpy(dp, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ok = false;
+                break;
+            }
+            l.la_w = x3::Mat{};
+            l.la_w.fmt = gg::kFmtQ8_0;
+            l.la_w.raw = dp;
+            l.la_w.k = dd;
+            l.la_w.n = ne;
+            l.la_w.ld = (int) rb;
+            vram += q.size();
+            ++got;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "ds4: lookahead weights %s: %d layers, %.0f MB VRAM%s\n", path.c_str(), got, vram / 1e6,
+                     ok ? "" : " (stopped: a bad or short file)");
     }
     // before init_store: staging, the pull's stream, the registered copies; a failure leaves it off
     void pf_init() {
@@ -6597,14 +6678,28 @@ struct Model::Impl {
         pf.dd.slots = cap;
         const size_t ns = (size_t) 2 * kPfSlots;
         bool ok = dalloc(d, pf.dd.buf, (size_t) 2 * cap * stride, err) && dalloc(d, pf.dd.ready, ns, err) && dalloc(d, pf.dd.cnt, ns, err) &&
-                  dalloc(d, pf.dd.gl, ns, err) && dalloc(d, pf.dd.gseq, 2, err) && dalloc(d, pf.dd.tm, 4, err);
+                  dalloc(d, pf.dd.tm, 4, err);
+        if (pf.sm) ok = ok && dalloc(d, pf.dd.gl, ns, err) && dalloc(d, pf.dd.gseq, 2, err);
+        else
+            ok = ok && hmap(pf.dd.gl, ns, err) && hmap(pf.dd.gseq, 2, err) && halloc(pf.stamp, kRing, err) &&
+                 dalloc(d, pf.dd.gld, ns, err) && dalloc(d, pf.dd.gseqd, 2, err);
+        if (pf.sm) {
+            pf.dd.gld = pf.dd.gl;
+            pf.dd.gseqd = pf.dd.gseq;
+        }
         for (Layer* l : tl) ok = ok && dalloc(d, l->pf_tab, (size_t) l->n_exp, err);
         if (!ok) {
             std::fprintf(stderr, "ds4: prefetch off: %s\n", err.c_str());
             pf.dd = PfDev{};
             return;
         }
-        cudaMemset(pf.dd.gl, 0xff, ns * sizeof(int));
+        cudaMemset(pf.dd.gld, 0xff, ns * sizeof(int));
+        cudaMemset(pf.dd.gseqd, 0, 2 * sizeof(unsigned));
+        if (!pf.sm) std::memset(pf.dd.gl, 0xff, ns * sizeof(int));
+        cudaMemset(pf.dd.ready, 0, ns * sizeof(unsigned));
+        cudaMemset(pf.dd.tm, 0, 4 * sizeof(unsigned long long));
+        for (auto& x : pf.tgt) x.store(-1);
+        pf.htab.assign(L.size(), {});
         int lo = 0, hi = 0;
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         if (cudaStreamCreateWithPriority(&pf.sB, cudaStreamNonBlocking, hi) != cudaSuccess ||
@@ -6626,8 +6721,109 @@ struct Model::Impl {
         pf.cap.store(cap);
         pf.cap_max = cap;
         pf.ok = true;
-        std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %d blocks, %.0f MB staging\n", pf.mode, cap,
-                     pf.blocks, (double) 2 * cap * (double) stride / 1e6);
+        if (!pf.sm && pf.mode == 1 && !pf.force_late) {
+            pf.run.store(true);
+            pf.mover = std::thread([this] { pf_move(); });
+        }
+        std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %s, %.0f MB staging\n", pf.mode, cap,
+                     pf.sm ? "pull kernel" : "copy engine", (double) 2 * cap * (double) stride / 1e6);
+    }
+    // the copy engine's thread: each list route_ahead publishes, copied into its staging slots,
+    // every expert followed by its ready stamp on the same stream
+    void pf_move() {
+        cudaSetDevice(devs[0].id);
+        unsigned done[2] = {0, 0};
+        while (pf.run.load(std::memory_order_relaxed)) {
+            pf.busy.store(true);
+            if (!pf.gate.load()) {
+                pf.busy.store(false);
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            bool did = false;
+            for (int par = 0; par < 2; ++par) {
+                const unsigned g = *(volatile const unsigned*) &pf.dd.gseq[par];
+                if (g == 0u || g == done[par]) continue;
+                done[par] = g;
+                did = true;
+                pf_issue(par, g);
+            }
+            pf.busy.store(false);
+            if (!did) cpu_relax();
+        }
+        std::fprintf(stderr, "ds4: prefetch: the copy engine took %lld lists, %lld experts, %lld lists cut short\n",
+                     (long long) pf.lists.load(), (long long) pf.copies.load(), (long long) pf.cancelled.load());
+    }
+    void pf_issue(int par, unsigned g) {
+        const int li = pf.tgt[g % kRing].load(std::memory_order_acquire);
+        if (li < 0 || li >= (int) L.size() || pf.htab[(size_t) li].empty()) return;
+        int lst[kPfSlots];
+        const int slots = std::min(pf.dd.slots, kPfSlots);
+        for (int q = 0; q < slots; ++q) lst[q] = *(volatile const int*) &pf.dd.gl[par * kPfSlots + q];
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (*(volatile const unsigned*) &pf.dd.gseq[par] != g) return;   // (rewritten while read)
+        if (pf.after_lane) {   // (the CPU lane's layer before done first: no DRAM shared with it)
+            const Resp& rp = resps[(g - 1u) % kRing];
+            while (*(volatile const unsigned*) &rp.seq != g - 1u) {
+                if (*(volatile const unsigned*) &pf.dd.gseq[par] != g || !pf.gate.load(std::memory_order_relaxed)) return;
+                cpu_relax();
+            }
+        }
+        ++pf.lists;
+        const PfMats& m = pf.mats[(size_t) li];
+        const std::vector<unsigned long long>& tab = pf.htab[(size_t) li];
+        pf.stamp[g % kRing] = g;
+        const bool whole = m.soff[1] - m.soff[0] == m.doff[1] - m.doff[0] && m.soff[2] - m.soff[0] == m.doff[2] - m.doff[0];
+        const size_t span = m.soff[2] + m.bytes[2] - m.soff[0];   // (one copy when both layouts agree)
+        int issued = 0;
+        for (int q = 0; q < slots; ++q) {
+            const int e = lst[q];
+            if (e < 0 || e >= (int) tab.size() || tab[(size_t) e] == 0ull) continue;
+            if (*(volatile const unsigned*) &pf.dd.gseq[par] != g) {   // (routed already: the rest is late)
+                ++pf.cancelled;
+                for (int z = q; z < slots; ++z) lst[z] = -1;
+                break;
+            }
+            uint8_t* dst = pf.dd.buf + ((size_t) par * pf.dd.slots + q) * pf.dd.stride;
+            if (whole)
+                cudaMemcpyAsync(dst + m.doff[0], (const void*) (tab[(size_t) e] + m.soff[0]), span,
+                                cudaMemcpyHostToDevice, pf.sB);
+            else
+                for (int r = 0; r < 3; ++r)
+                    cudaMemcpyAsync(dst + m.doff[r], (const void*) (tab[(size_t) e] + m.soff[r]), m.bytes[r],
+                                    cudaMemcpyHostToDevice, pf.sB);
+            cudaMemcpyAsync(pf.dd.ready + par * kPfSlots + q, pf.stamp + g % kRing, sizeof(unsigned),
+                            cudaMemcpyHostToDevice, pf.sB);
+            ++pf.copies;
+            ++issued;
+        }
+        if (pf.check && issued > 0 && pf.checked.load() < 200) pf_check(li, par, lst, slots);
+    }
+    // DS4_PREFETCH_CHECK (copy engine): the staged blobs against their RAM copies, on the mover's thread
+    void pf_check(int li, int par, const int* lst, int slots) {
+        if (cudaStreamSynchronize(pf.sB) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        const PfMats& m = pf.mats[(size_t) li];
+        const std::vector<unsigned long long>& tab = pf.htab[(size_t) li];
+        std::vector<uint8_t> h;
+        for (int q = 0; q < slots; ++q) {
+            const int e = lst[q];
+            if (e < 0 || e >= (int) tab.size() || tab[(size_t) e] == 0ull) continue;
+            ++pf.checked;
+            const uint8_t* b = pf.dd.buf + ((size_t) par * pf.dd.slots + q) * pf.dd.stride;
+            for (int r = 0; r < 3; ++r) {
+                h.resize(m.bytes[r]);
+                if (cudaMemcpyAsync(h.data(), b + m.doff[r], m.bytes[r], cudaMemcpyDeviceToHost, pf.sB) != cudaSuccess ||
+                    cudaStreamSynchronize(pf.sB) != cudaSuccess ||
+                    std::memcmp(h.data(), (const void*) (tab[(size_t) e] + m.soff[r]), m.bytes[r]) != 0) {
+                    (void) cudaGetLastError();
+                    if (pf.bad++ < 8)
+                        std::fprintf(stderr, "ds4: prefetch: layer %d expert %d matrix %d staged differently\n", li, e, r);
+                }
+            }
+        }
     }
     // an armed request's guesses against its picks; a mostly late pull halves the slots
     void pf_count(const Req& r, const Layer& l, int late) {
@@ -6667,24 +6863,6 @@ struct Model::Impl {
             }
         } else pf.win_clean = 0;
         pf.win_req = pf.win_late = pf.win_planned = 0;
-    }
-    // DS4_PREFETCH_CHECK: staged blobs against their RAM copies (the first 200)
-    void pf_verify(const Layer& l, int e, int q, unsigned seq) {
-        if (!pf.check || st.pf_checked >= 200) return;
-        ++st.pf_checked;
-        cudaSetDevice(devs[0].id);
-        const uint8_t* b = pf.dd.buf + ((size_t) (seq & 1u) * pf.dd.slots + (size_t) q) * pf.dd.stride;
-        std::vector<uint8_t> h;
-        for (int r = 0; r < 3; ++r) {
-            const PfMats& m = pf.mats[(size_t) l.il];
-            h.resize(m.bytes[r]);
-            if (cudaMemcpy(h.data(), b + m.doff[r], m.bytes[r], cudaMemcpyDeviceToHost) != cudaSuccess ||
-                std::memcmp(h.data(), mx_mat(l, e, r), m.bytes[r]) != 0) {
-                (void) cudaGetLastError();
-                if (st.pf_bad++ < 8)
-                    std::fprintf(stderr, "ds4: prefetch: layer %d expert %d matrix %d staged differently\n", l.il, e, r);
-            }
-        }
     }
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
@@ -6813,8 +6991,6 @@ struct Model::Impl {
                             if (pfo) {
                                 if ((r.pf_own[0] >> i) & 1u) {
                                     ++st.pf_hit;
-                                    for (int q = 0; q < std::min(r.pf_n, kPfSlots); ++q)
-                                        if (r.pf_plan[q] == e) pf_verify(l, e, q, next);
                                     continue;
                                 }
                                 bool planned = false;
@@ -8913,6 +9089,7 @@ struct Model::Impl {
         const double tl = now_ms();
         pf.live = pf.ok && T == 1;   // (pf_init: one device, so --threads on has one worker)
         if (pf.ok) std::fill(pf.armed.begin(), pf.armed.end(), 0);
+        if (pf.live) pf.gate.store(true);
         if (par) {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
@@ -8927,6 +9104,10 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
         pf.live = false;
+        pf.gate.store(false);
+        while (pf.busy.load()) cpu_relax();   // (the mover idle: no copy issued past this point)
+        st.pf_bad += pf.bad.exchange(0);
+        st.pf_checked = pf.checked.load();
         if (pf.ok) {   // (every pull ends before the swaps rewrite the tables)
             const cudaError_t pe = cudaStreamSynchronize(pf.sB);
             if (pe != cudaSuccess) {
@@ -9375,11 +9556,16 @@ struct Model::Impl {
                 if (nx == nullptr) break;
                 const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
+                if (nx->la_w.raw != nullptr) {
+                    if (!mv(d, {job(nx->la_w, d.x, gl, T, (size_t) D, 1024)}, err)) return false;
+                } else
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                if (a == 1 && pn != nullptr) pf.tgt[wp.seq[nx->il] % kRing].store(nx->il, std::memory_order_release);
                 route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s,
                             a == 1 && pn != nullptr
-                                ? PfAhead{nx->vram_tab, nx->pf_tab, pf.dd.gl, pf.dd.gseq, wp.seq[nx->il], pd.cap}
+                                ? PfAhead{nx->vram_tab, nx->pf_tab, pf.dd.gl, pf.dd.gseq, wp.seq[nx->il], pd.cap,
+                                          pf.dd.gld, pf.dd.gseqd}
                                 : PfAhead{});
                 na[a - 1] = m;
             }
@@ -9388,7 +9574,7 @@ struct Model::Impl {
                           na[1], pf.live && pf.armed[(size_t) l.il] ? pd : PfDev{});
             if (pn != nullptr) {
                 pf.armed[(size_t) pn->il] = 1;   // (mode 2: nothing is pulled)
-                if (pf.mode == 1 && !pf.force_late) {   // (after publish_kernel)
+                if (pf.sm && pf.mode == 1 && !pf.force_late) {   // (after publish_kernel)
                     CK(cudaEventRecord(pf.ev, s));
                     CK(cudaStreamWaitEvent(pf.sB, pf.ev, 0));
                     pf_pull(pd, pf.mats[(size_t) pn->il], wp.seq[pn->il], pn->pf_tab, pf.blocks, pf.sB);

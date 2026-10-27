@@ -1523,12 +1523,13 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         unsigned rdy = 0, own = 0;
         int lst[kPfSlots];
         for (int q = 0; q < kPfSlots; ++q) lst[q] = -1;
-        if (pfa && *(volatile const unsigned*) &pf.gseq[par] == sq) {
+        if (pfa && *(volatile const unsigned*) &pf.gseqd[par] == sq) {
             for (int q = 0; q < pf.cap; ++q)
                 if (*(volatile const unsigned*) &pf.ready[par * kPfSlots + q] == sq) rdy |= 1u << q;
             __threadfence();
-            for (int q = 0; q < pf.cap; ++q) lst[q] = *(volatile const int*) &pf.gl[par * kPfSlots + q];
-            *(volatile unsigned*) &pf.gseq[par] = 0u;   // (consumed: a pull still running or queued stops)
+            for (int q = 0; q < pf.cap; ++q) lst[q] = *(volatile const int*) &pf.gld[par * kPfSlots + q];
+            *(volatile unsigned*) &pf.gseqd[par] = 0u;   // (consumed: a pull still running or queued stops)
+            if (pf.gseq != pf.gseqd) *(volatile unsigned*) &pf.gseq[par] = 0u;
             __threadfence();
         }
         for (int r = 0; r < k; ++r) {
@@ -1588,7 +1589,8 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     const unsigned par = pa.seq & 1u;
     logits += (size_t) t * 1024;
     if (threadIdx.x == 0 && pa.gl != nullptr) {
-        *(volatile unsigned*) &pa.gseq[par] = 0u;
+        *(volatile unsigned*) &pa.gseqd[par] = 0u;
+        if (pa.gseq != pa.gseqd) *(volatile unsigned*) &pa.gseq[par] = 0u;
         __threadfence();
         nf = 0;
     }
@@ -1619,17 +1621,27 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
             if (r < m) req->ahead[t][off + r] = ix < n ? ix : -1;
             if (ix < n) bs[ix] = -FLT_MAX;
-            if (pa.gl != nullptr && nf < pa.B && ix < n && pa.vram_next[ix] == 0ull && pa.pf_next[ix] != 0ull)
-                pa.gl[par * kPfSlots + nf++] = ix;
+            if (pa.gl != nullptr && nf < pa.B && ix < n && pa.vram_next[ix] == 0ull && pa.pf_next[ix] != 0ull) {
+                pa.gld[par * kPfSlots + nf] = ix;
+                if (pa.gl != pa.gld) pa.gl[par * kPfSlots + nf] = ix;
+                ++nf;
+            }
             stop = (r + 1 >= m) && (pa.gl == nullptr || nf >= pa.B);
         }
         __syncthreads();
         if (stop) break;
     }
     if (threadIdx.x == 0 && pa.gl != nullptr) {
-        for (int q = nf; q < kPfSlots; ++q) pa.gl[par * kPfSlots + q] = -1;
+        for (int q = nf; q < kPfSlots; ++q) {
+            pa.gld[par * kPfSlots + q] = -1;
+            if (pa.gl != pa.gld) pa.gl[par * kPfSlots + q] = -1;
+        }
         __threadfence();
-        *(volatile unsigned*) &pa.gseq[par] = pa.seq;
+        *(volatile unsigned*) &pa.gseqd[par] = pa.seq;
+        if (pa.gseq != pa.gseqd) {   // (the copy engine's thread reads its own copy, host-mapped)
+            __threadfence_system();
+            *(volatile unsigned*) &pa.gseq[par] = pa.seq;
+        }
     }
 }
 
