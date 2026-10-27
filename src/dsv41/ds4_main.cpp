@@ -35,6 +35,7 @@
 #include <memory>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <cstdlib>
 #include <cstring>
@@ -1257,7 +1258,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         else if (a == "--ids") ids_s = val("--ids");
-        else if (a == "--n") n = std::atoi(val("--n").c_str());
+        else if (a == "--ids-file") {
+            std::ifstream in(val("--ids-file"));
+            ids_s.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        } else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--score") score_ids = val("--score");

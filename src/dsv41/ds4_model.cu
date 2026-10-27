@@ -1158,6 +1158,54 @@ struct Model::Impl {
     std::FILE* xin_f = std::getenv("DS4_XIN_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XIN_DUMP"), "wb") : nullptr;
     int xin_n = std::getenv("DS4_XIN_N") ? std::atoi(std::getenv("DS4_XIN_N")) : 1024;
     std::FILE* xat_f = std::getenv("DS4_XAT_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XAT_DUMP"), "wb") : nullptr;
+    std::FILE* xhc_f = std::getenv("DS4_XHC_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XHC_DUMP"), "wb") : nullptr;
+    // the dumps' rows: fp16 on the device, written by a thread of their own (at most 4 GB queued)
+    struct DumpQ {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::pair<std::FILE*, std::vector<uint8_t>>> q;
+        size_t bytes = 0;
+        bool stop = false;
+        std::thread th;
+    } dq_;
+    uint16_t* dump16 = nullptr;
+    size_t dump16_n = 0;
+    void dump_rows(std::FILE* f, int il, int T, const float* src, int rows, int cols, cudaStream_t s) {
+        const size_t n = (size_t) rows * cols;
+        if (n > dump16_n) {
+            if (dump16 != nullptr) cudaFree(dump16);
+            dump16_n = cudaMalloc(&dump16, n * 2) == cudaSuccess ? n : 0;
+            if (dump16_n == 0) return;
+        }
+        x3::rows_f16(src, cols, nullptr, rows, cols, dump16, s);
+        std::vector<uint8_t> b(3 + n * 2);
+        b[0] = (uint8_t) (il | 0x80);
+        b[1] = (uint8_t) (T & 255);
+        b[2] = (uint8_t) (T >> 8);
+        if (cudaMemcpyAsync(b.data() + 3, dump16, n * 2, cudaMemcpyDeviceToHost, s) != cudaSuccess ||
+            cudaStreamSynchronize(s) != cudaSuccess)
+            return;
+        std::unique_lock<std::mutex> lk(dq_.mu);
+        dq_.cv.wait(lk, [&] { return dq_.bytes < (4ull << 30); });
+        if (!dq_.th.joinable()) dq_.th = std::thread([this] { dump_loop(); });
+        dq_.bytes += b.size();
+        dq_.q.emplace_back(f, std::move(b));
+        dq_.cv.notify_all();
+    }
+    void dump_loop() {
+        std::unique_lock<std::mutex> lk(dq_.mu);
+        for (;;) {
+            dq_.cv.wait(lk, [&] { return dq_.stop || !dq_.q.empty(); });
+            if (dq_.q.empty()) return;
+            auto it = std::move(dq_.q.front());
+            dq_.q.pop_front();
+            lk.unlock();
+            std::fwrite(it.second.data(), 1, it.second.size(), it.first);
+            lk.lock();
+            dq_.bytes -= it.second.size();
+            dq_.cv.notify_all();
+        }
+    }
     std::array<int, 64> xin_got{};
     std::FILE* trace_f = std::getenv("DS4_TRACE") != nullptr ? std::fopen(std::getenv("DS4_TRACE"), "wb") : nullptr;
     struct ProfMark {
@@ -1247,6 +1295,14 @@ struct Model::Impl {
 
     ~Impl() {
         quit.store(true);
+        {
+            std::lock_guard<std::mutex> lk(dq_.mu);
+            dq_.stop = true;
+            dq_.cv.notify_all();
+        }
+        if (dq_.th.joinable()) dq_.th.join();
+        for (std::FILE* f : {xin_f, xat_f, xhc_f})
+            if (f != nullptr) std::fflush(f);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
@@ -6561,6 +6617,13 @@ struct Model::Impl {
                                 const uint8_t b = status(l, r.ids[t][i]);
                                 std::fwrite(&b, 1, 1, trace_f);
                             }
+                    static const bool with_slots = std::getenv("DS4_TRACE_SLOTS") != nullptr;
+                    if (with_slots) {   // DS4_TRACE_SLOTS=1: then the layer's VRAM set, 48 bytes, a bit an expert
+                        uint8_t bm[48] = {};
+                        for (int e = 0; e < std::min(l.n_exp, 384); ++e)
+                            if (l.slot[(size_t) e] >= 0) bm[e >> 3] |= (uint8_t) (1u << (e & 7));
+                        std::fwrite(bm, 1, sizeof bm, trace_f);
+                    }
                     if (with_ahead) {
                         const uint8_t na[2] = {(uint8_t) std::max(0, std::min(r.na[0], kAhead1)), (uint8_t) std::max(0, std::min(r.na[1], kPicks))};
                         std::fwrite(na, 1, 2, trace_f);
@@ -7161,20 +7224,15 @@ struct Model::Impl {
             }
         }
         prof_mark(d, 4);
+        if (xhc_f != nullptr && mi == 0 && !l.mtp)   // DS4_XHC_DUMP: the H residual streams before attention
+            dump_rows(xhc_f, l.il, T, c.h, T * H, D, s);
         // attention
         if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
-        if (xat_f != nullptr && mi == 0 && !l.mtp) {   // DS4_XAT_DUMP: the attention inputs, as DS4_XIN_ALL
-            std::lock_guard<std::mutex> lk(dump_mu);
-            std::vector<uint16_t> hx((size_t) T * D);
-            CK(cudaMemcpyAsync(hx.data(), c.x16, hx.size() * 2, cudaMemcpyDeviceToHost, s));
-            CK(cudaStreamSynchronize(s));
-            const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
-            std::fwrite(hd, 1, 3, xat_f);
-            std::fwrite(hx.data(), 2, hx.size(), xat_f);
-        }
+        if (xat_f != nullptr && mi == 0 && !l.mtp)   // DS4_XAT_DUMP: the attention inputs, as DS4_XIN_ALL
+            dump_rows(xat_f, l.il, T, c.x, T, D, s);
         prof_mark(d, 5);
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
                          !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
@@ -7458,14 +7516,7 @@ struct Model::Impl {
             }
             static const bool xin_all = std::getenv("DS4_XIN_ALL") != nullptr;
             if (xin_f != nullptr && xin_all) {   // every row, fp16, header layer | 0x80
-                std::vector<float> hx((size_t) T * D);
-                CK(cudaMemcpyAsync(hx.data(), c.x, hx.size() * 4, cudaMemcpyDeviceToHost, s));
-                CK(cudaStreamSynchronize(s));
-                std::vector<uint16_t> o(hx.size());
-                for (size_t i = 0; i < hx.size(); ++i) o[i] = strata::kernels::f16_from_f32(hx[i]);
-                const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
-                std::fwrite(hd, 1, 3, xin_f);
-                std::fwrite(o.data(), 2, o.size(), xin_f);
+                dump_rows(xin_f, l.il, T, c.x, T, D, s);
             } else if (xin_f != nullptr && xin_got[(size_t) l.il] < xin_n) {   // up to 32 evenly spaced tokens of the chunk
                 const int tk = std::min(std::min(T, 32), xin_n - xin_got[(size_t) l.il]);
                 const int stride = std::max(1, T / tk);
@@ -9173,6 +9224,9 @@ struct Model::Impl {
         hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
                      d.f_pre, d.f_post, d.f_comb, s);
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        static const bool xin_win = std::getenv("DS4_XIN_ALL") != nullptr;
+        if (xin_f != nullptr && xin_win && mi == 0 && !l.mtp && wp.async)   // (the windows and the decode, as DS4_XIN_ALL)
+            dump_rows(xin_f, l.il, T, d.x, T, D, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
