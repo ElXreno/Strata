@@ -4651,10 +4651,12 @@ struct Model::Impl {
     // saw all of it free.  The explicit sizes (--ssd-cache, DS4_STORE_GB) stand.
     mutable uint64_t avail0_ = ~uint64_t{0};   // (free RAM when the first estimate was made, before the weights went to the GPU)
     double store_gb_now() const {
+        static double cached = -2.0;   // (decided once: pf_init asks right before init_store)
+        if (cached > -1.5) return cached;
         const double gb = store_gb();
-        if (gb <= 0.0 || o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return gb;
+        if (gb <= 0.0 || o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return cached = gb;
         const uint64_t avail = ram_avail();
-        if (avail == ~uint64_t{0}) return gb;
+        if (avail == ~uint64_t{0}) return cached = gb;
         // (the prompt buffers and the context's caches are touched after this point and, on such a machine, take RAM too: measured on
         // Strix Halo about 0.11 MB a token of context beyond 16384, a 40960 context ending 2.5 GB lower than a 16384 one)
         const bool uma = avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
@@ -4664,7 +4666,7 @@ struct Model::Impl {
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
                          (double) avail / 1e9, now, gb);
-        return std::min(gb, now);
+        return cached = std::min(gb, now);
     }
     void init_store() {
         const double gb = store_gb_now();
@@ -6555,7 +6557,7 @@ struct Model::Impl {
 #else
         if (!copy_mode) why = "the CPU lane's experts are not copied into RAM (--mmap-experts off)";
         else if (NH != 1 || devs.size() != 1 || L.empty() || L[0].nm != 1) why = "it needs one device, one RAM part";
-        else if (store_gb() > 0.0 || ram_tier) why = "the RAM store or tier is on";
+        else if (store_gb_now() > 0.0 || ram_tier) why = "the RAM store or tier is on";
         else if (cudaDeviceGetAttribute(&reg_ok, cudaDevAttrHostRegisterSupported, devs[0].id) != cudaSuccess || !reg_ok)
             why = "the driver cannot register host memory";
 #endif
