@@ -1012,6 +1012,7 @@ struct Model::Impl {
         std::vector<uint8_t> dirty;
         std::vector<std::pair<uint8_t*, size_t>> reg;
         int64_t win_late = 0, win_planned = 0, win_req = 0;
+        int cap_max = 0, win_clean = 0;
     } pf;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
@@ -6457,7 +6458,8 @@ struct Model::Impl {
         if (store || l0.mtp || j >= g.nl || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
         if (n.dev != l0.dev || n.mtp || n.cpu_only || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
-            (int) n.slot.size() < n.n_exp || n.pf_tab == nullptr)
+            (int) n.slot.size() < n.n_exp || n.pf_tab == nullptr || (size_t) n.il >= pf.pinned.size() ||
+            !pf.pinned[(size_t) n.il])
             return nullptr;
         return &n;
     }
@@ -6620,6 +6622,7 @@ struct Model::Impl {
             return;
         }
         pf.cap.store(cap);
+        pf.cap_max = cap;
         pf.ok = true;
         std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %d blocks, %.0f MB staging\n", pf.mode, cap,
                      pf.blocks, (double) 2 * cap * (double) stride / 1e6);
@@ -6650,9 +6653,17 @@ struct Model::Impl {
         const int cap = pf.cap.load();
         if (pf.mode == 1 && !pf.force_late && cap > 1 && pf.win_late * 10 > pf.win_planned * 8) {
             pf.cap.store(std::max(1, cap / 2));
+            pf.win_clean = 0;
             std::fprintf(stderr, "ds4: prefetch: %lld of %lld copies late, up to %d experts a layer now\n",
                          (long long) pf.win_late, (long long) pf.win_planned, std::max(1, cap / 2));
-        }
+        } else if (pf.mode == 1 && !pf.force_late && cap < pf.cap_max && pf.win_planned > 0 &&
+                   pf.win_late * 10 <= pf.win_planned) {   // (two clean windows in a row: one slot back)
+            if (++pf.win_clean >= 2) {
+                pf.cap.store(cap + 1);
+                pf.win_clean = 0;
+                std::fprintf(stderr, "ds4: prefetch: copies on time, up to %d experts a layer again\n", cap + 1);
+            }
+        } else pf.win_clean = 0;
         pf.win_req = pf.win_late = pf.win_planned = 0;
     }
     // DS4_PREFETCH_CHECK: staged blobs against their RAM copies (the first 200)
@@ -8898,7 +8909,7 @@ struct Model::Impl {
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
-        pf.live = pf.ok && !par && T == 1;
+        pf.live = pf.ok && T == 1;   // (pf_init: one device, so --threads on has one worker)
         if (pf.ok) std::fill(pf.armed.begin(), pf.armed.end(), 0);
         if (par) {
             if (!forward_par(p0, T, err)) return false;

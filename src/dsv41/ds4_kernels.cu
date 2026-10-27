@@ -1528,6 +1528,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 if (*(volatile const unsigned*) &pf.ready[par * kPfSlots + q] == sq) rdy |= 1u << q;
             __threadfence();
             for (int q = 0; q < pf.cap; ++q) lst[q] = *(volatile const int*) &pf.gl[par * kPfSlots + q];
+            *(volatile unsigned*) &pf.gseq[par] = 0u;   // (consumed: a pull still running or queued stops)
+            __threadfence();
         }
         for (int r = 0; r < k; ++r) {
             const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
@@ -1597,7 +1599,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const int rmax = pa.gl != nullptr ? min(n, kAhead1) : m;
+    const int rmax = pa.gl != nullptr ? min(min(n, kAhead1), m + kPfScanExtra) : m;
     for (int r = 0; r < rmax; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
@@ -2077,7 +2079,13 @@ __global__ void __launch_bounds__(512) pf_pull_kernel(PfDev pf, PfMats m, unsign
     const int n = cnt;
     if (n == 0) return;
     if (blockIdx.x == 0 && threadIdx.x == 0) pf.tm[par * 2] = globaltimer_ns();
+    __shared__ int live;
     for (int i = 0; i < n; ++i) {
+        if (threadIdx.x == 0) live = *(volatile const unsigned*) &pf.gseq[par] == seq;
+        __syncthreads();
+        const bool alive = live != 0;
+        __syncthreads();
+        if (!alive) return;   // (route_publish consumed the list: the rest would only take DRAM from the lane)
         const unsigned long long src = pf_next[lst[i]];
         if (src == 0ull) continue;
         uint8_t* dst = pf.buf + ((size_t) par * pf.slots + i) * pf.stride;

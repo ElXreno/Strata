@@ -215,6 +215,7 @@ constexpr int kRing = 64;
 constexpr int kMaxDim = 8192;
 constexpr int kAhead1 = 16, kAhead = kAhead1 + kPicks;   // a token's guesses for the next layer, then the one after
 constexpr int kPfSlots = 8;   // staged experts a layer at most (the prefetch)
+constexpr int kPfScanExtra = 4;   // route_ahead ranks scanned for pullable experts past the m guesses
 /// The prefetch's device state, by value into the kernels (buf null: off for this layer).
 /// Two parities (seq & 1 of the target layer), kPfSlots staging slots each.
 struct PfDev {
