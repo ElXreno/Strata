@@ -1500,6 +1500,35 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
     }
+    {
+        double rt = 0, rb[8];
+        for (int i = 0; i < 8; ++i) rt += rb[i] = (double) (s.re_bin[i] - s0.re_bin[i]);
+        if (rt > 0)
+            std::fprintf(stderr,
+                         "pred-eval reuse: CPU-lane picks last a CPU-lane pick of the same layer 1 / 2 / 3-4 / 5-8 / 9-16 / "
+                         "17-64 / >64 tokens before / never: %.1f / %.1f / %.1f / %.1f / %.1f / %.1f / %.1f / %.1f %%\n",
+                         100 * rb[0] / rt, 100 * rb[1] / rt, 100 * rb[2] / rt, 100 * rb[3] / rt, 100 * rb[4] / rt,
+                         100 * rb[5] / rt, 100 * rb[6] / rt, 100 * rb[7] / rt);
+    }
+    for (int h = 0; h < 2; ++h) {   // DS4_PRED_EVAL
+        const double req = (double) (s.pe_req[h] - s0.pe_req[h]);
+        if (req <= 0) continue;
+        double tot = 0;
+        for (int i = 0; i < 17; ++i) tot += (double) (s.pe_pos[h][i] - s0.pe_pos[h][i]);
+        std::string b;
+        double cum = 0;
+        for (int i = 0; i < 16; ++i) {
+            cum += (double) (s.pe_pos[h][i] - s0.pe_pos[h][i]);
+            char c[16];
+            std::snprintf(c, sizeof c, " %.1f", 100.0 * cum / std::max(1.0, tot));
+            b += c;
+        }
+        std::fprintf(stderr,
+                     "pred-eval layers %s: %.0f layer-requests, CPU-lane picks %.2f a layer, non-VRAM guesses %.2f a layer; "
+                     "%% of CPU-lane picks among the first B non-VRAM guesses, B = 1..16:%s\n",
+                     h == 0 ? "first half" : "second half", req, tot / req,
+                     (double) (s.pe_nonres[h] - s0.pe_nonres[h]) / req, b.c_str());
+    }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
         double sum = 0;

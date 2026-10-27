@@ -88,6 +88,8 @@ struct Stats {
     int64_t ahead_picks = 0, ahead_hit_k = 0, ahead_hit = 0, ahead_hit2 = 0;
     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
+    int64_t pe_pos[2][17] = {}, pe_nonres[2] = {}, pe_req[2] = {};   // DS4_PRED_EVAL, by layer half
+    int64_t re_bin[8] = {};   // DS4_PRED_EVAL: CPU-lane picks by tokens since the last one
     // the RAM store (--ssd-cache), totals since the load: reads asked for and found there (hits), missed (misses), started ahead
     // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
     int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;

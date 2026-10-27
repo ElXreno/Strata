@@ -999,6 +999,8 @@ struct Model::Impl {
                                        // 8 asked for (prefetch)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
+    std::vector<std::vector<int64_t>> re_last;   // DS4_PRED_EVAL: [layer][expert] its last CPU-lane token
+    std::vector<int64_t> re_cnt;
     std::thread pf_th;
     std::mutex pf_mu;
     std::condition_variable pf_cv;
@@ -1153,6 +1155,7 @@ struct Model::Impl {
     std::FILE* pred_f = std::getenv("DS4_PRED_DUMP") != nullptr ? std::fopen(std::getenv("DS4_PRED_DUMP"), "wb") : nullptr;
     std::FILE* xin_f = std::getenv("DS4_XIN_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XIN_DUMP"), "wb") : nullptr;
     int xin_n = std::getenv("DS4_XIN_N") ? std::atoi(std::getenv("DS4_XIN_N")) : 1024;
+    std::FILE* xat_f = std::getenv("DS4_XAT_DUMP") != nullptr ? std::fopen(std::getenv("DS4_XAT_DUMP"), "wb") : nullptr;
     std::array<int, 64> xin_got{};
     std::FILE* trace_f = std::getenv("DS4_TRACE") != nullptr ? std::fopen(std::getenv("DS4_TRACE"), "wb") : nullptr;
     struct ProfMark {
@@ -5814,6 +5817,21 @@ struct Model::Impl {
                 acc[0] += tp1 - tp0; acc[1] += tp2 - tp1; acc[2] += tp3 - tp2; acc[3] += te - tp3; acc[4] += 1; acc[5] += ne;
                 if (((long long) acc[4]) % 1000 == 0)
                     std::fprintf(stderr, "ds4 prof CPU lane (IQ rows) per call: n %.0f, entries/call %.2f, prep %.3f ms, gate+up %.3f ms, h-quant %.3f ms, down %.3f ms\n", acc[4], acc[5] / acc[4], acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4]);
+                static double by[7][3] = {};   // by entries (1 .. 6+): calls, gate/up ms, down ms
+                const int b = std::min(ne, 6);
+                by[b][0] += 1;
+                by[b][1] += tp2 - tp1;
+                by[b][2] += te - tp3;
+                if (((long long) acc[4]) % 4000 == 0) {
+                    std::string s = "ds4 prof CPU lane by entries (calls, gate+up ms, down ms):";
+                    for (int i = 1; i <= 6; ++i) {
+                        char c[64];
+                        std::snprintf(c, sizeof c, " %d: %.0f %.3f %.3f", i, by[i][0], by[i][1] / std::max(1.0, by[i][0]),
+                                      by[i][2] / std::max(1.0, by[i][0]));
+                        s += c;
+                    }
+                    std::fprintf(stderr, "%s\n", s.c_str());
+                }
             }
         }
     }
@@ -6392,6 +6410,10 @@ struct Model::Impl {
         }
     }
     // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
+    static bool pred_eval_on() {
+        static const bool on = std::getenv("DS4_PRED_EVAL") != nullptr;
+        return on;
+    }
     static bool file_read(const Layer& l, int e) {
         return l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
     }
@@ -6401,9 +6423,10 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
-            (int) n.slot.size() < n.n_exp)
+        if (n.dev != l0.dev || n.mtp != l0.mtp || (n.lay.fmt != gg::kFmtMXFP4 && !pred_eval_on()) || n.gate_w == nullptr ||
+            n.n_exp > 1024 || (int) n.slot.size() < n.n_exp)
             return nullptr;
+        if (pred_eval_on()) return &n;
         for (int e = 0; e < n.n_exp; ++e)
             if (file_read(n, e)) return &n;
         return nullptr;
@@ -6430,7 +6453,7 @@ struct Model::Impl {
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
-                    if ((fl[e] & 8) || !file_read(n, e)) continue;
+                    if ((fl[e] & 8) || !file_read(n, e) || pred_eval_on()) continue;
                     fl[e] |= 8;
                     if (store) store->prefetch(j, e);
                     else
@@ -6494,6 +6517,17 @@ struct Model::Impl {
                             const int16_t v = (int16_t) r.ids[t][i];
                             std::fwrite(&v, 2, 1, trace_f);
                         }
+                    static const bool with_cpu = std::getenv("DS4_TRACE_CPU") != nullptr;
+                    auto status = [](const Layer& x, int e) -> uint8_t {   // 1: not in VRAM, 2: in a RAM copy
+                        if (e < 0 || e >= x.n_exp) return 0;
+                        return (uint8_t) ((x.slot[(size_t) e] < 0 ? 1 : 0) | (!x.ram.empty() && x.ram[(size_t) e] >= 0 ? 2 : 0));
+                    };
+                    if (with_cpu)
+                        for (int t = 0; t < T; ++t)
+                            for (int i = 0; i < l.k_exp; ++i) {
+                                const uint8_t b = status(l, r.ids[t][i]);
+                                std::fwrite(&b, 1, 1, trace_f);
+                            }
                     if (with_ahead) {
                         const uint8_t na[2] = {(uint8_t) std::max(0, std::min(r.na[0], kAhead1)), (uint8_t) std::max(0, std::min(r.na[1], kPicks))};
                         std::fwrite(na, 1, 2, trace_f);
@@ -6507,8 +6541,32 @@ struct Model::Impl {
                                 std::fwrite(&v, 2, 1, trace_f);
                             }
                         }
+                        if (with_cpu && li + 1 < (int) L.size())   // (the guesses' status in the next layer)
+                            for (int t = 0; t < T; ++t)
+                                for (int i = 0; i < na[0]; ++i) {
+                                    const uint8_t b = status(L[(size_t) li + 1], r.ahead[t][i]);
+                                    std::fwrite(&b, 1, 1, trace_f);
+                                }
                     }
                 }
+                static const bool pred_eval = std::getenv("DS4_PRED_EVAL") != nullptr;
+                int16_t pe_at[1024];
+                const int pe_half = li < g.nl / 2 ? 0 : 1;
+                if (fl != nullptr && pred_eval) {   // position of each guess among the non-VRAM guesses
+                    const uint8_t* rk = ahead_rank.data() + (size_t) li * 1024;
+                    int by_rank[17];
+                    std::fill(by_rank, by_rank + 17, -1);
+                    for (int e = 0; e < l.n_exp && e < 1024; ++e) {
+                        pe_at[e] = -1;
+                        if (rk[e] > 0 && rk[e] <= 16 && l.slot[(size_t) e] < 0) by_rank[rk[e]] = e;
+                    }
+                    int n = 0;
+                    for (int q = 1; q <= 16; ++q)
+                        if (by_rank[q] >= 0) pe_at[by_rank[q]] = (int16_t) n++;
+                    st.pe_nonres[pe_half] += n;
+                    ++st.pe_req[pe_half];
+                }
+                if (T == 1 && pred_eval && re_cnt.size() == L.size()) ++re_cnt[(size_t) li];
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 for (int t = 0; t < T; ++t) {
                     float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
@@ -6528,6 +6586,17 @@ struct Model::Impl {
                         }
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
+                            if (fl != nullptr && pred_eval) ++st.pe_pos[pe_half][pe_at[e] < 0 ? 16 : pe_at[e]];
+                            if (T == 1 && pred_eval) {   // tokens since this expert was last a CPU-lane pick here
+                                if (re_last.size() != L.size()) {
+                                    re_last.assign(L.size(), std::vector<int64_t>(1024, -1));
+                                    re_cnt.assign(L.size(), 0);
+                                }
+                                const int64_t pv = re_last[(size_t) li][(size_t) e], d = re_cnt[(size_t) li] - pv;
+                                const int b = pv < 0 ? 7 : d <= 1 ? 0 : d <= 2 ? 1 : d <= 4 ? 2 : d <= 8 ? 3 : d <= 16 ? 4 : d <= 64 ? 5 : 6;
+                                ++st.re_bin[b];
+                                re_last[(size_t) li][(size_t) e] = re_cnt[(size_t) li];
+                            }
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
                                 ++st.store_zc;
@@ -7064,6 +7133,15 @@ struct Model::Impl {
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        if (xat_f != nullptr && mi == 0 && !l.mtp) {   // DS4_XAT_DUMP: the attention inputs, as DS4_XIN_ALL
+            std::lock_guard<std::mutex> lk(dump_mu);
+            std::vector<uint16_t> hx((size_t) T * D);
+            CK(cudaMemcpyAsync(hx.data(), c.x16, hx.size() * 2, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+            std::fwrite(hd, 1, 3, xat_f);
+            std::fwrite(hx.data(), 2, hx.size(), xat_f);
+        }
         prof_mark(d, 5);
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
                          !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
@@ -7345,7 +7423,17 @@ struct Model::Impl {
                 std::fwrite(hd, 1, 3, pred_f);
                 std::fwrite(o.data(), 2, o.size(), pred_f);
             }
-            if (xin_f != nullptr && xin_got[(size_t) l.il] < xin_n) {   // up to 32 evenly spaced tokens of the chunk
+            static const bool xin_all = std::getenv("DS4_XIN_ALL") != nullptr;
+            if (xin_f != nullptr && xin_all) {   // every row, fp16, header layer | 0x80
+                std::vector<float> hx((size_t) T * D);
+                CK(cudaMemcpyAsync(hx.data(), c.x, hx.size() * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                std::vector<uint16_t> o(hx.size());
+                for (size_t i = 0; i < hx.size(); ++i) o[i] = strata::kernels::f16_from_f32(hx[i]);
+                const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+                std::fwrite(hd, 1, 3, xin_f);
+                std::fwrite(o.data(), 2, o.size(), xin_f);
+            } else if (xin_f != nullptr && xin_got[(size_t) l.il] < xin_n) {   // up to 32 evenly spaced tokens of the chunk
                 const int tk = std::min(std::min(T, 32), xin_n - xin_got[(size_t) l.il]);
                 const int stride = std::max(1, T / tk);
                 std::vector<float> hx((size_t) T * D);
