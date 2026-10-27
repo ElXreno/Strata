@@ -103,7 +103,7 @@ void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
 // IQ1_M from one token too: ggml's own IQ1_M dot (and IQ1_S's) uses _pdep_u64 where the build has BMI2, which AMD Zen 1/2 run in
 // microcode - 1.8 GB/s against these rows' 33 GB/s on an EPYC 7452 (a 2.00 set decodes 3x slower on one card), 19-31 GB/s on Intel.
 // The rows are bit-identical, so taking them at every token count only changes the speed.
-static int min_tokens(int type) { return type == 21 ? 1 : type == 29 ? 1 : 2; }
+static int min_tokens(int type) { return type == 19 || type == 21 || type == 29 ? 1 : 2; }
 static bool own_ok(int type, int impl) {
     static std::once_flag once[2][32];
     static bool ok[2][32];
