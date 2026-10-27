@@ -12,6 +12,7 @@
 // Plain C++ (no PTX), shuffles and shared memory only: the HIP port is a rename.
 #pragma once
 #include "ds4_kernels.cuh"
+#include "ds4_pdl.cuh"
 #include "ds4_numerics.cuh"
 #include <cuda_fp16.h>
 
@@ -42,6 +43,8 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
                                                  const uint8_t* __restrict__ ckv, size_t ckv_row_bytes, const int* __restrict__ sel,
                                                  int sel_stride, AttnRows ar, int heads, float scale, float* __restrict__ part,
                                                  float* __restrict__ ml, int nsplit) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int D = 512;
     __shared__ __align__(16) uint16_t rows[R][D];
     __shared__ float sc[G][R];
@@ -166,6 +169,8 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
 
 __global__ void __launch_bounds__(256) attn_merge(const float* __restrict__ part, const float* __restrict__ ml, const float* __restrict__ sink,
                                                   int heads, int nsplit, int R, AttnRows ar, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int D = 512;
     const int h = blockIdx.x, t = blockIdx.y;
     const int total = ar.nwin[t] + ar.nsel[t];
@@ -198,8 +203,9 @@ void sparse_attn_split(const float* q, const uint16_t* win, const uint8_t* ckv, 
                        const AttnRows& ar, const float* sink, int heads, int T, float scale, float* out, const AttnSplitScratch& sc,
                        int total_max, cudaStream_t s) {
     const int nsplit = (total_max + R - 1) / R;
-    attn_part<G, R><<<dim3(heads / G, nsplit, T), 256, 0, s>>>(q, win, ckv, ckv_row_bytes, sel, sel_stride, ar, heads, scale, sc.part, sc.ml, sc.nsplit);
-    attn_merge<<<dim3(heads, T), 256, 0, s>>>(sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out);
+    pdl_launch(attn_part<G, R>, dim3(heads / G, nsplit, T), 256, 0, s, q, win, ckv, ckv_row_bytes, sel, sel_stride, ar,
+               heads, scale, sc.part, sc.ml, sc.nsplit);
+    pdl_launch(attn_merge, dim3(heads, T), 256, 0, s, sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out);
 }
 
 }  // namespace attnsplit
