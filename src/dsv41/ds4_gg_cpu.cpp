@@ -71,9 +71,17 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
 }
 
 // x (k values) -> the activation type (Q8_K, Q8_0 ..) ggml-cpu's dot takes
+static bool q8k_avx2(int act, int k) {
+    static const bool on = strata::kernels::cpu::cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
+    return on && act == (int) GGML_TYPE_Q8_K && k % 256 == 0;
+}
 void gg_cpu_quant(int act, const float* x, int k, void* dst) {
     init_once();
     if (dbg()) std::fprintf(stderr, "gg_cpu_quant act %d k %d\n", act, k);
+    if (q8k_avx2(act, k)) {
+        strata::kernels::cpu::q8k_quant_avx2(x, dst, k);
+        return;
+    }
     const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) act);
     if (tc != nullptr && tc->from_float != nullptr) {
         tc->from_float(x, dst, k);
