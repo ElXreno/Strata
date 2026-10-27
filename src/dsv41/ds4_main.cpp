@@ -1500,6 +1500,34 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
     }
+    if (s.pf_req > s0.pf_req) {   // prefetch
+        const double rq = (double) (s.pf_req - s0.pf_req), pl = (double) (s.pf_planned - s0.pf_planned);
+        const double hit = (double) (s.pf_hit - s0.pf_hit), late = (double) (s.pf_late - s0.pf_late);
+        const double ung = (double) (s.pf_unguessed - s0.pf_unguessed), fil = (double) (s.pf_file - s0.pf_file);
+        const double lane = late + ung + fil, blob_mb = 6.912, tm = (double) (s.pf_timed - s0.pf_timed);
+        std::fprintf(stderr,
+                     "prefetch: %.1f guessed a token, %.1f ready in time, %.1f used (precision %.1f%%, coverage %.1f%% of the "
+                     "CPU-lane picks); CPU-lane picks left: %.1f a token (late %.1f, unguessed %.1f, file %.1f); %.1f MB "
+                     "pulled and %.1f MB unused a token; %lld ready but not picked, %lld staged blobs checked, %lld differ\n",
+                     pl / nt, (double) (s.pf_ready - s0.pf_ready) / nt, hit / nt, 100.0 * hit / std::max(1.0, pl),
+                     100.0 * hit / std::max(1.0, hit + lane), lane / nt, late / nt, ung / nt, fil / nt, pl * blob_mb / nt,
+                     (pl - hit) * blob_mb / nt, (long long) (s.pf_wasted_ready - s0.pf_wasted_ready),
+                     (long long) (s.pf_checked - s0.pf_checked), (long long) (s.pf_bad - s0.pf_bad));
+        std::string pr = "prefetch: picked by the guess's slot (non-VRAM rank, 1 ..):";
+        for (int i = 0; i < 8; ++i) {
+            const long long n = (long long) (s.pf_rank_n[i] - s0.pf_rank_n[i]);
+            if (n <= 0) break;
+            char b[24];
+            std::snprintf(b, sizeof b, " %.0f%%", 100.0 * (double) (s.pf_rank_hit[i] - s0.pf_rank_hit[i]) / (double) n);
+            pr += b;
+        }
+        std::fprintf(stderr, "%s\n", pr.c_str());
+        if (tm > 0)
+            std::fprintf(stderr, "prefetch: %.0f us a full pull (%.0f requests), %.0f us from its end to the routing's read "
+                                 "(%.1f requests a token armed)\n",
+                         (double) (s.pf_pull_ns - s0.pf_pull_ns) / 1e3 / tm, tm,
+                         (double) (s.pf_slack_ns - s0.pf_slack_ns) / 1e3 / tm, rq / nt);
+    }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
         double sum = 0;

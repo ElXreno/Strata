@@ -1458,12 +1458,21 @@ __global__ void combine_kernel(const float* __restrict__ ed, const float* __rest
     out[(size_t) t * dim + e] = a;
 }
 
+__device__ __forceinline__ unsigned long long globaltimer_ns() {
+    unsigned long long t = 0;
+#if defined(__CUDA_ARCH__) && !defined(STRATA_USE_HIP)
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+#endif
+    return t;
+}
+
 __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restrict__ logits,
                                                             const float* __restrict__ bias, int n, int k,
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl, PfDev pf,
+                                                            unsigned sq) {
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
@@ -1508,16 +1517,50 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
         int cpu = 0;
+        // prefetch: the slots complete now, read once
+        const bool pfa = pf.buf != nullptr && t == 0;
+        const unsigned par = sq & 1u;
+        unsigned rdy = 0, own = 0;
+        int lst[kPfSlots];
+        for (int q = 0; q < kPfSlots; ++q) lst[q] = -1;
+        if (pfa && *(volatile const unsigned*) &pf.gseq[par] == sq) {
+            for (int q = 0; q < pf.cap; ++q)
+                if (*(volatile const unsigned*) &pf.ready[par * kPfSlots + q] == sq) rdy |= 1u << q;
+            __threadfence();
+            for (int q = 0; q < pf.cap; ++q) lst[q] = *(volatile const int*) &pf.gl[par * kPfSlots + q];
+        }
         for (int r = 0; r < k; ++r) {
             const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            unsigned long long p = vram[pick[r]];
+            if (p == 0ull && rdy != 0u)
+                for (int q = 0; q < pf.cap; ++q)
+                    if (((rdy >> q) & 1u) && lst[q] == pick[r]) {
+                        p = (unsigned long long) (pf.buf + ((size_t) par * pf.slots + q) * pf.stride);
+                        own |= 1u << r;
+                        break;
+                    }
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
-            plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
-            cpu |= vram[pick[r]] == 0ull;
+            plan_ptr[(size_t) t * kPicks + r] = p;
+            cpu |= p == 0ull;
             if (req != nullptr) {
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
             }
+        }
+        if (req != nullptr && pfa) {
+            int n = 0;
+            for (int q = 0; q < kPfSlots; ++q) {
+                req->pf_plan[q] = lst[q];
+                n += lst[q] >= 0;
+            }
+            req->pf_n = n;
+            req->pf_own[0] = own;
+            req->pf_rdy = rdy;
+            req->pf_t[0] = pf.tm[par * 2];
+            req->pf_t[1] = pf.tm[par * 2 + 1];
+            req->pf_t[2] = globaltimer_ns();
+            req->pf_seq = sq;
         }
         on_cpu = cpu;
     }
@@ -1529,16 +1572,24 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
 }
 
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
+// with pa.gl also the best pa.B of the top kAhead1 not in VRAM but pullable, into pa.gl by rank
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
-                                                          int off) {
+                                                          int off, PfAhead pa) {
     pdl_wait();
     pdl_trigger();
     __shared__ float bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
+    __shared__ int nf, stop;
     const int t = blockIdx.x;
+    const unsigned par = pa.seq & 1u;
     logits += (size_t) t * 1024;
+    if (threadIdx.x == 0 && pa.gl != nullptr) {
+        *(volatile unsigned*) &pa.gseq[par] = 0u;
+        __threadfence();
+        nf = 0;
+    }
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
@@ -1546,7 +1597,8 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    for (int r = 0; r < m; ++r) {
+    const int rmax = pa.gl != nullptr ? min(n, kAhead1) : m;
+    for (int r = 0; r < rmax; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -1563,10 +1615,19 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
-            req->ahead[t][off + r] = ix < n ? ix : -1;
+            if (r < m) req->ahead[t][off + r] = ix < n ? ix : -1;
             if (ix < n) bs[ix] = -FLT_MAX;
+            if (pa.gl != nullptr && nf < pa.B && ix < n && pa.vram_next[ix] == 0ull && pa.pf_next[ix] != 0ull)
+                pa.gl[par * kPfSlots + nf++] = ix;
+            stop = (r + 1 >= m) && (pa.gl == nullptr || nf >= pa.B);
         }
         __syncthreads();
+        if (stop) break;
+    }
+    if (threadIdx.x == 0 && pa.gl != nullptr) {
+        for (int q = nf; q < kPfSlots; ++q) pa.gl[par * kPfSlots + q] = -1;
+        __threadfence();
+        *(volatile unsigned*) &pa.gseq[par] = pa.seq;
     }
 }
 
@@ -1968,17 +2029,96 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, PfDev pf) {
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, T == 1 ? pf : PfDev{}, seq);
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 PfAhead pa) {
+    if (T != 1 || pa.B <= 0 || pa.B > kPfSlots) pa = PfAhead{};
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
-        pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
+        pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off, pa);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) {
     pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq);
+}
+
+__device__ __forceinline__ uint4 pf_ld(const uint4* p) {
+#if defined(STRATA_USE_HIP)
+    return *p;
+#else
+    return __ldcs(p);
+#endif
+}
+
+// the prefetch's pull: the experts route_ahead listed for layer `seq`, one by one, by all blocks;
+// the last block of an expert stamps it ready
+__global__ void __launch_bounds__(512) pf_pull_kernel(PfDev pf, PfMats m, unsigned seq,
+                                                      const unsigned long long* __restrict__ pf_next) {
+    __shared__ int lst[kPfSlots];
+    __shared__ int cnt;
+    const unsigned par = seq & 1u;
+    if (threadIdx.x == 0) {
+        cnt = 0;
+        if (*(volatile const unsigned*) &pf.gseq[par] == seq) {
+            __threadfence();
+            int c = 0;
+            while (c < pf.cap && c < kPfSlots) {
+                const int e = *(volatile const int*) &pf.gl[par * kPfSlots + c];
+                if (e < 0) break;
+                lst[c++] = e;
+            }
+            __threadfence();
+            if (*(volatile const unsigned*) &pf.gseq[par] == seq) cnt = c;
+        }
+    }
+    __syncthreads();
+    const int n = cnt;
+    if (n == 0) return;
+    if (blockIdx.x == 0 && threadIdx.x == 0) pf.tm[par * 2] = globaltimer_ns();
+    for (int i = 0; i < n; ++i) {
+        const unsigned long long src = pf_next[lst[i]];
+        if (src == 0ull) continue;
+        uint8_t* dst = pf.buf + ((size_t) par * pf.slots + i) * pf.stride;
+        for (int r = 0; r < 3; ++r) {
+            const uint4* sp = (const uint4*) (src + m.soff[r]);
+            uint4* dp = (uint4*) (dst + m.doff[r]);
+            const size_t nv = m.bytes[r] / 16, step = (size_t) gridDim.x * blockDim.x;
+            size_t o = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+            for (; o + 3 * step < nv; o += 4 * step) {
+                const uint4 a = pf_ld(sp + o), b = pf_ld(sp + o + step), c = pf_ld(sp + o + 2 * step),
+                            d = pf_ld(sp + o + 3 * step);
+                dp[o] = a;
+                dp[o + step] = b;
+                dp[o + 2 * step] = c;
+                dp[o + 3 * step] = d;
+            }
+            for (; o < nv; o += step) dp[o] = pf_ld(sp + o);
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned long long* cp = pf.cnt + par * kPfSlots + i;
+            unsigned long long old = *(volatile unsigned long long*) cp, nw;
+            for (;;) {
+                nw = (old >> 32) == seq ? old + 1 : (((unsigned long long) seq << 32) | 1ull);
+                const unsigned long long was = atomicCAS(cp, old, nw);
+                if (was == old) break;
+                old = was;
+            }
+            if ((unsigned) (nw & 0xffffffffull) == gridDim.x) {
+                __threadfence();
+                *(volatile unsigned*) &pf.ready[par * kPfSlots + i] = seq;
+                if (i == n - 1) pf.tm[par * 2 + 1] = globaltimer_ns();
+            }
+        }
+        __syncthreads();
+    }
+}
+void pf_pull(const PfDev& pf, const PfMats& m, unsigned seq, const unsigned long long* pf_next, int blocks,
+             cudaStream_t s) {
+    pf_pull_kernel<<<blocks, 512, 0, s>>>(pf, m, seq, pf_next);
 }
 
 // the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds

@@ -214,6 +214,30 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 constexpr int kRing = 64;
 constexpr int kMaxDim = 8192;
 constexpr int kAhead1 = 16, kAhead = kAhead1 + kPicks;   // a token's guesses for the next layer, then the one after
+constexpr int kPfSlots = 8;   // staged experts a layer at most (the prefetch)
+/// The prefetch's device state, by value into the kernels (buf null: off for this layer).
+/// Two parities (seq & 1 of the target layer), kPfSlots staging slots each.
+struct PfDev {
+    unsigned* ready = nullptr;            // [2][kPfSlots]: seq once the slot is complete
+    unsigned long long* cnt = nullptr;    // [2][kPfSlots]: (seq << 32) | blocks done
+    int* gl = nullptr;                    // [2][kPfSlots]: guessed experts by rank, -1 padded
+    unsigned* gseq = nullptr;             // [2]: the seq gl is for (0 while written)
+    uint8_t* buf = nullptr;               // [2][slots][stride]
+    size_t stride = 0;
+    int slots = 0;                        // staging slots a parity holds
+    int cap = 0;                          // slots in use (<= slots)
+    unsigned long long* tm = nullptr;     // [2][2] globaltimer: pull begin, pull end
+};
+struct PfAhead {
+    const unsigned long long *vram_next = nullptr, *pf_next = nullptr;
+    int* gl = nullptr;
+    unsigned* gseq = nullptr;
+    unsigned seq = 0;
+    int B = 0;
+};
+struct PfMats {   // three matrices: offset in a RAM copy, in the staged blob, bytes
+    size_t soff[3] = {0, 0, 0}, doff[3] = {0, 0, 0}, bytes[3] = {0, 0, 0};
+};
 struct Req {
     unsigned seq;
     int T;
@@ -222,6 +246,12 @@ struct Req {
     float w[kWin][kPicks];
     int ahead[kWin][kAhead];
     float x[kWin][kMaxDim];
+    unsigned pf_seq;               // prefetch: == seq when the fields below are this request's
+    unsigned pf_own[kWin];         // bit i: pick i is staged (the CPU lane leaves it out)
+    int pf_n;                      // guesses planned (pf_plan[0 .. pf_n))
+    int pf_plan[kPfSlots];         // the guessed experts by staging slot
+    unsigned pf_rdy;               // bit s: slot s was complete at the routing
+    unsigned long long pf_t[3];    // globaltimer: pull begin, pull end, routing read
 };
 struct Resp {
     unsigned seq;
@@ -234,10 +264,16 @@ struct Resp {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, PfDev pf = {});
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// pa.gl: also the best pa.B guesses that are not in VRAM but pullable, by rank.
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 PfAhead pa = {});
+/// The prefetch's pull: the experts route_ahead listed for layer `seq`, from their RAM copies
+/// (pf_next[expert]) into the staging slots, each complete once its ready stamp equals seq.
+void pf_pull(const PfDev& pf, const PfMats& m, unsigned seq, const unsigned long long* pf_next, int blocks,
+             cudaStream_t s);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

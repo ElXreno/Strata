@@ -88,6 +88,12 @@ struct Stats {
     int64_t ahead_picks = 0, ahead_hit_k = 0, ahead_hit = 0, ahead_hit2 = 0;
     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
+    // prefetch, per armed request: guesses planned, complete when read (ready), picked (rank_hit);
+    // picks left to the device (hit), planned but late, unguessed (a RAM copy), unpullable (file);
+    // ready but not picked; staged blobs checked and differing; pull time and slack (ns, pf_timed)
+    int64_t pf_req = 0, pf_planned = 0, pf_ready = 0, pf_hit = 0, pf_late = 0, pf_unguessed = 0, pf_file = 0;
+    int64_t pf_wasted_ready = 0, pf_bad = 0, pf_checked = 0, pf_timed = 0, pf_pull_ns = 0, pf_slack_ns = 0;
+    int64_t pf_rank_n[8] = {}, pf_rank_hit[8] = {};
     // the RAM store (--ssd-cache), totals since the load: reads asked for and found there (hits), missed (misses), started ahead
     // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
     int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;
