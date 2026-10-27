@@ -9387,6 +9387,8 @@ struct Model::Impl {
     void serve_lane() {
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        bool doze = false;
         std::vector<Ent> ents;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
@@ -9396,7 +9398,9 @@ struct Model::Impl {
                 // before every request and Windows' sleep_for(20 us) wakes after ~1 ms or more: the lane's round trip.  Now it
                 // spins for DS4_LANE_SPIN_MS (default 250) after its last answer, i.e. through a whole decode token.)
                 static const long spin_ms = std::getenv("DS4_LANE_SPIN_MS") ? std::atol(std::getenv("DS4_LANE_SPIN_MS")) : 250;
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(spin_ms)) {
+                if (!doze && (++spins & 1023u) == 0)
+                    doze = std::chrono::steady_clock::now() - last > std::chrono::milliseconds(spin_ms);
+                if (doze) {
 #if defined(_WIN32)
                     // DS4_LANE_NAP=sleep turns it off: a high-resolution waitable timer (Windows 10 1803+) instead of sleep_for's timer tick
                     static const bool hires = !(std::getenv("DS4_LANE_NAP") != nullptr && std::string(std::getenv("DS4_LANE_NAP")) == "sleep");
@@ -9412,6 +9416,7 @@ struct Model::Impl {
                 }
                 continue;
             }
+            doze = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
