@@ -13,6 +13,13 @@
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)
+#define STRATA_POOL_WAITPKG 1
+#elif defined(__GNUC__) && defined(__x86_64__) && !defined(_WIN32)
+#define STRATA_POOL_WAITPKG 2
+#include <cpuid.h>
+#include <x86intrin.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,14 +46,27 @@ namespace {
 // epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
 // after the cycles, in the light C0.1 state; on a laptop the CPU then gives back the power the spin took, which the
 // GPU's share of the budget gets.  0 or unset (or no WAITPKG): the spin, unchanged.  STRATA_POOL_UMWAIT_C02=1: the
-// deeper C0.2 state (slower wake).  MSVC x64 only for now (the intrinsics need no target flag there); other builds spin.
+// deeper C0.2 state (slower wake).  MSVC x64 and x86-64 Linux GCC/Clang; other builds spin.
+#if STRATA_POOL_WAITPKG == 1
+inline void pool_umonitor(void* p) { _umonitor(p); }
+inline void pool_umwait(unsigned st, uint64_t deadline) { _umwait(st, deadline); }
+#elif STRATA_POOL_WAITPKG == 2
+inline void pool_umonitor(void* p) { asm volatile("umonitor %0" : : "r"(p) : "memory"); }
+inline void pool_umwait(unsigned st, uint64_t deadline) {
+    asm volatile("umwait %0" : : "r"(st), "d"((uint32_t) (deadline >> 32)), "a"((uint32_t) deadline) : "memory", "cc");
+}
+#endif
 uint64_t umwait_cycles() {
     static const uint64_t c = [] {
         const char* e = std::getenv("STRATA_POOL_UMWAIT");
         if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
-#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+#if defined(STRATA_POOL_WAITPKG)
         int r[4] = {0, 0, 0, 0};
+#if STRATA_POOL_WAITPKG == 1
         __cpuidex(r, 7, 0);
+#else
+        __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
         if (((r[2] >> 5) & 1) == 0) {
             std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
             return (uint64_t) 0;
@@ -993,19 +1013,19 @@ void ExpertPool::worker(int id) {
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
         const uint64_t um = umwait_cycles();
-#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+#if defined(STRATA_POOL_WAITPKG)
         const uint64_t um_esc = umwait_escalate();
         const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
 #endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+#if defined(STRATA_POOL_WAITPKG)
             if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
-                _umonitor((void*) &epoch_);
+                pool_umonitor((void*) &epoch_);
                 if (epoch_.load(std::memory_order_acquire) != seen) break;
                 const uint64_t now = __rdtsc();
                 const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
-                _umwait(st, now + um);
+                pool_umwait(st, now + um);
                 if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
             } else
 #endif
