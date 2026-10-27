@@ -7,6 +7,7 @@
 #if defined(STRATA_METAL)
 #include <ds4_metal_host.h>
 #endif
+#include "ds4_pdl.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_experts_rule.hpp"
 
@@ -609,6 +610,8 @@ constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10
 // sub-block decoded once for them) -> h = the clamped swiglu
 template <int T, int NE, int RW = kGuRW>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int groups) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     constexpr int kBPS = kQK<T> == 32 ? 1 : 8, kStep = LPR / kBPS;   // sub-blocks a block; blocks a lane steps
     static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
@@ -672,6 +675,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
 // grid (n_embd / (8 RW), groups): RW rows of the down a warp for NE entries a pass, against their int8 h -> part
 template <int T, int NE, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     constexpr int kBPS = kQK<T> == 32 ? 1 : 8, kStep = LPR / kBPS;   // sub-blocks a block; blocks a lane steps
     static_assert(LPR % kBPS == 0, "a lane keeps one sub-block position");
@@ -731,6 +736,8 @@ static_assert((BM / TM) * (BN / TN) == kThreads, "one output tile a thread");
 // outputs.  (deq8 is the tile loader a tensor-core form takes too.)
 template <int T, bool GATE_UP, int RM = BM>
 __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int RT = RM / (kThreads / (BN / TN));
     static_assert(RT >= 1 && RT * (kThreads / (BN / TN)) == RM, "the block's rows");
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
@@ -819,6 +826,8 @@ namespace wm = nvcuda::wmma;
 constexpr int kLdT = 40;
 template <int T, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
     struct Tiles {
         __half x[BM][kLdT], wg[BN][kLdT], wu[GATE_UP ? BN : 1][kLdT];
     };
@@ -909,6 +918,8 @@ struct Jobs {
 };
 template <int T, int NC>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -954,6 +965,8 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
                                                            const int* __restrict__ idx, int ldx, int k,
                                                            const int* __restrict__ bounds, int row0,
                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.y / kLightRows, i = blockIdx.y % kLightRows;
     const int rows = bounds[e + 1] - bounds[e];
     const int b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -1021,6 +1034,8 @@ __device__ __forceinline__ void light_item(const SetArgs& a, const int8_t* __res
 template <int T, int NE, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
                                                                           const float* __restrict__ xd) {
+    pdl_wait();
+    pdl_trigger();
     constexpr bool kF = NE <= 4;   // (the fast codebook only for the few-row kernels, which loop over work items round the grid)
     __shared__ __align__(16) uint32_t tab[kTabWords<T, kF>];
     const int N = GATE_UP ? a.n_ff : a.n_embd, ntile = (N + kWarps - 1) / kWarps;
@@ -1038,6 +1053,8 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
 template <int T, int NE, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, const int8_t* __restrict__ xq,
                                                           const float* __restrict__ xd) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     const int e = blockIdx.y;
     const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
@@ -1155,17 +1172,19 @@ template <int T, int NE>
 void launch_gu(const Args& a, int groups, cudaStream_t s) {
     const int tiles = a.n_ff / (kWarps * kGuRW);
     if constexpr (kPersist<T>)
-        strata_ds4_launch(gate_up_kernel<T, NE>, items_grid<T>(groups * tiles, resident_ctas<gate_up_kernel<T, NE, kGuRW>>()), kThreads, 0, s, a, groups);
+        pdl_launch(gate_up_kernel<T, NE>, items_grid<T>(groups * tiles, resident_ctas<gate_up_kernel<T, NE, kGuRW>>()),
+                   kThreads, 0, s, a, groups);
     else
-        strata_ds4_launch(gate_up_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
+        pdl_launch(gate_up_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, int groups, cudaStream_t s) {
     const int tiles = a.n_embd / (kWarps * kDnRW);
     if constexpr (kPersist<T>)
-        strata_ds4_launch(down_kernel<T, NE>, items_grid<T>(groups * tiles, resident_ctas<down_kernel<T, NE, kDnRW>>()), kThreads, 0, s, a, groups);
+        pdl_launch(down_kernel<T, NE>, items_grid<T>(groups * tiles, resident_ctas<down_kernel<T, NE, kDnRW>>()),
+                   kThreads, 0, s, a, groups);
     else
-        strata_ds4_launch(down_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
+        pdl_launch(down_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
 }
 template <int T>
 void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
@@ -1189,16 +1208,16 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #endif
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
-        strata_ds4_launch(set_tc_kernel<T, GU>, grid, kThreads, 0, s, a);
+        pdl_launch(set_tc_kernel<T, GU>, grid, kThreads, 0, s, a);
         return;
     }
 #endif
     if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
         grid.x = (unsigned) ((a.max_rows + 15) / 16);
-        strata_ds4_launch(set_kernel<T, GU, 16>, grid, kThreads, 0, s, a);
+        pdl_launch(set_kernel<T, GU, 16>, grid, kThreads, 0, s, a);
         return;
     }
-    strata_ds4_launch(set_kernel<T, GU>, grid, kThreads, 0, s, a);
+    pdl_launch(set_kernel<T, GU>, grid, kThreads, 0, s, a);
 }
 // the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
 struct LightBuf {
@@ -1238,13 +1257,15 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const int tiles = ((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps;
     if (a.max_rows <= 4) {   // few rows: work items round a persistent grid (the codebook per block is then the cost)
         if constexpr (kPersist<T>)
-            strata_ds4_launch(light_kernel<T, 4, GU>, items_grid<T>(a.n_exp * tiles, resident_ctas<light_kernel<T, 4, GU>>()), kThreads, 0, s, a, b.q, b.d);
+            pdl_launch(light_kernel<T, 4, GU>, items_grid<T>(a.n_exp * tiles, resident_ctas<light_kernel<T, 4, GU>>()),
+                       kThreads, 0, s, a, b.q, b.d);
         else   // (a small codebook: the release's kernel, which is the faster there)
-            strata_ds4_launch(light_kernel_rows<T, 4, GU>, dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, s, a, b.q, b.d);
+            pdl_launch(light_kernel_rows<T, 4, GU>, dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, s, a, b.q,
+                       b.d);
     } else {   // more rows: compute bound, the release's kernel and grid
         const dim3 grid((unsigned) tiles, (unsigned) a.n_exp);
-        if (a.max_rows <= 8) strata_ds4_launch(light_kernel_rows<T, 8, GU>, grid, kThreads, 0, s, a, b.q, b.d);
-        else strata_ds4_launch(light_kernel_rows<T, kLightRows, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+        if (a.max_rows <= 8) pdl_launch(light_kernel_rows<T, 8, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+        else pdl_launch(light_kernel_rows<T, kLightRows, GU>, grid, kThreads, 0, s, a, b.q, b.d);
     }
 }
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
@@ -1252,7 +1273,7 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
-    strata_ds4_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
+    pdl_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
                                             a.row0, b->q, b->d);
     if (gu) {
         if (a.tg == kMXFP4) {
@@ -1294,14 +1315,14 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
                 b.xd += (size_t) c0 * nsb;
                 b.y += (size_t) c0 * b.ycs;
             }
-            strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, K);
+            pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, K);
         }
         return;
     }
 #endif
-    if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
-    else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
-    else strata_ds4_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
+    if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
+    else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
 
 
@@ -1367,6 +1388,8 @@ __host__ __device__ constexpr bool dq_old_ok() {
 template <int T>
 __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
                                                            uint16_t* __restrict__ dst, bool bf16) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1468,7 +1491,7 @@ bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* 
     const bool old = dq_use_old_kernel();
 #define DS4_DQ(T) do {                                                                                    \
         if (old && dq_old_ok<T>())                                                                        \
-            strata_ds4_launch(dq_rows_kernel<T>, blocks, kThreads, 0, s, (const uint8_t*) raw, ld, k, n, dst, bf16);      \
+            pdl_launch(dq_rows_kernel<T>, blocks, kThreads, 0, s, (const uint8_t*) raw, ld, k, n, dst, bf16);      \
         else                                                                                              \
             strata_ds4_launch(dq_rows_kernel2<T>, blocks, kThreads, 0, s, (const uint8_t*) raw, ld, k, n, dst, bf16);     \
     } while (0)
