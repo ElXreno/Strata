@@ -308,6 +308,7 @@ adaptive tier's swap policy offline.
 | `--spec N`, `--spec-min-p P` | Draft depth and the confidence needed to add a guess. Setup's default is `--spec 4 --spec-min-p 0.5`. |
 | `--draft-vocab en\|cyrillic\|fr` (setup) | The draft layer can only propose tokens from a subset of the vocabulary. The default subset includes every Chinese, Japanese and Korean token. `en` keeps the English and code subset (~110 MiB less VRAM, English 1-2% faster, CJK gets almost no drafts). `cyrillic` and `fr` add those scripts. `tools/draft_vocab.py` builds and inspects subsets. |
 | `--lookup-chain-min M`, `--mtp-hnorm stream`, `--mtp-draft-vocab FILE` | Finer controls: the shortest context match `--lookup-chain` extends (default 3), one norm per stream, and a token subset of your own. |
+| `--lookup-max-t N`, `--lookup-sizes A,B,...` (opt-in) | Prompt-lookup windows up to N tokens (8 < N <= 16, one conversation) while the MTP keeps `--spec`; a window past 8 runs as two token groups of 8. Each size is a CUDA graph (~20-35 MiB), so past the MTP's sizes only `--lookup-sizes` get one (default `--spec`+1, `--spec`+2 and N). Same tokens; copy-heavy edits decode +19% on an RTX 2060 SUPER. |
 
 When the start stops with "the draft head does not fit" (a 12 GB card with a long context), the engine says how much it needs
 and which smaller subset fits. Setup suggests `--draft-vocab en` on cards under 14 GB; nothing changes unless you pass it.
