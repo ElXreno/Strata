@@ -389,6 +389,61 @@ __global__ void __launch_bounds__(kThreads) hc_mix_split_kernel(const float* __r
     if (threadIdx.x == 0) cnt[t] = 0u;
 }
 
+// hc_mix_split_kernel with each mix's dot over kHcS blocks (a slice of hcdim each): the last block of the token sums
+// the slices in order, then runs the split. Decode and short windows only (T <= kHcT): the partial sums live here
+constexpr int kHcS = 8, kHcT = 8;
+__device__ float g_hcw_part[kHcT * 32 * kHcS];
+__device__ float g_hcw_ss[kHcT * kHcS];
+__global__ void __launch_bounds__(kThreads) hc_mix_split_wide_kernel(const float* __restrict__ h,
+                                                                     const float* __restrict__ fn, int hcdim, int n_mix,
+                                                                     float eps, float* mixes, unsigned* cnt,
+                                                                     const float* __restrict__ scale,
+                                                                     const float* __restrict__ base, int hc, int iters,
+                                                                     float hc_eps, float* pre, float* post, float* comb) {
+    pdl_wait();
+    pdl_trigger();
+    const int m = blockIdx.x / kHcS, sl = blockIdx.x % kHcS, t = blockIdx.y;
+    const int chunk = hcdim / kHcS;
+    const float* w = fn + (size_t) m * hcdim + (size_t) sl * chunk;
+    const float* x = h + (size_t) t * hcdim + (size_t) sl * chunk;
+    float acc = 0.0f, ss = 0.0f;
+    for (int k = threadIdx.x * 4; k < chunk; k += kThreads * 4) {
+        const float4 hv = *(const float4*) (x + k);
+        const float4 wv = *(const float4*) (w + k);
+        acc += hv.x * wv.x + hv.y * wv.y + hv.z * wv.z + hv.w * wv.w;
+        ss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
+    }
+    acc = block_sum(acc);
+    ss = block_sum(ss);
+    __shared__ unsigned last;
+    __shared__ float smx[32];
+    if (threadIdx.x == 0) {
+        g_hcw_part[((size_t) t * 32 + m) * kHcS + sl] = acc;
+        if (m == 0) g_hcw_ss[t * kHcS + sl] = ss;
+        __threadfence();
+        last = atomicAdd(cnt + t, 1u) == gridDim.x - 1 ? 1u : 0u;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    __shared__ float sp[32 * kHcS + kHcS];   // (every partial in one round of loads, then summed in order)
+    for (int i = threadIdx.x; i < n_mix * kHcS; i += blockDim.x) sp[i] = ld_fresh(&g_hcw_part[(size_t) t * 32 * kHcS + i]);
+    if (threadIdx.x < kHcS) sp[32 * kHcS + threadIdx.x] = ld_fresh(&g_hcw_ss[t * kHcS + threadIdx.x]);
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float tss = 0.0f, a = 0.0f;
+        for (int q = 0; q < kHcS; ++q) tss += sp[32 * kHcS + q];
+        if (threadIdx.x < n_mix)
+            for (int q = 0; q < kHcS; ++q) a += sp[threadIdx.x * kHcS + q];
+        const float v = threadIdx.x < n_mix ? a * rsqrtf(tss / (float) hcdim + eps) : 0.0f;
+        smx[threadIdx.x] = v;
+        if (threadIdx.x < n_mix) mixes[(size_t) t * 32 + threadIdx.x] = v;
+        __syncwarp();
+        hc_split_body(smx, t, threadIdx.x, scale, base, hc, iters, hc_eps, pre, post, comb);
+    }
+    if (threadIdx.x == 0) cnt[t] = 0u;
+}
+
 __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restrict__ h, const float* __restrict__ mix,
                                                            const float* __restrict__ w, int dim, int hc, float eps,
                                                            float* __restrict__ x) {
@@ -501,12 +556,13 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
                                                             int n, int k, float* __restrict__ y, int ldy) {
     pdl_wait();
     pdl_trigger();
-    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t = blockIdx.y;
     if (row >= n) return;
     const float4* w = (const float4*) (W + (size_t) row * k);
     const float4* xv = (const float4*) (x + (size_t) t * k);
     float acc = 0.0f;
+#pragma unroll 4
     for (int c = lane; c < k / 4; c += 32) {
         const float4 a = w[c], b = xv[c];
         acc = fmaf(a.x, b.x, acc);
@@ -1466,6 +1522,32 @@ __device__ __forceinline__ unsigned long long globaltimer_ns() {
     return t;
 }
 
+// the k largest of v[0 .. n) (n <= 1024), ties to the smaller index - the block loops' order - into out[0 .. k): one
+// warp, no block barrier between the rounds
+__device__ __forceinline__ void warp_topk(const float* v, int n, int k, int* out, int lane) {
+    float r[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) r[j] = lane + 32 * j < n ? v[lane + 32 * j] : -FLT_MAX;
+    for (int q = 0; q < k; ++q) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int i = lane + 32 * j;
+            if (i < n && (r[j] > best || (r[j] == best && i < bix))) best = r[j], bix = i;
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) out[q] = bix;
+#pragma unroll
+        for (int j = 0; j < 32; ++j)
+            if (lane + 32 * j == bix) r[j] = -FLT_MAX;
+    }
+}
+
 __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restrict__ logits,
                                                             const float* __restrict__ bias, int n, int k,
                                                             float route_scale, const unsigned long long* __restrict__ vram,
@@ -1476,8 +1558,6 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
-    __shared__ float bv[32];
-    __shared__ int bi[32];
     __shared__ int pick[16];
     __shared__ int on_cpu;
     const int t = blockIdx.x;
@@ -1490,29 +1570,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    for (int r = 0; r < k; ++r) {
-        float best = -FLT_MAX;
-        int bix = 0x7fffffff;
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
-            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
-        }
-        if (lane == 0) bv[wp] = best, bi[wp] = bix;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float b = -FLT_MAX;
-            int ix = 0x7fffffff;
-            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
-                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
-            pick[r] = ix;
-            bs[ix] = -FLT_MAX;
-        }
-        __syncthreads();
-    }
+    if (threadIdx.x < 32) warp_topk(bs, n, k, pick, threadIdx.x);
+    __syncthreads();
     if (threadIdx.x == 0) {
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
@@ -1532,8 +1591,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             if (pf.gseq != pf.gseqd) *(volatile unsigned*) &pf.gseq[par] = 0u;
             __threadfence();
         }
+        unsigned long long pp[kPicks];
+        int nx = 0;
         for (int r = 0; r < k; ++r) {
-            const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
             unsigned long long p = vram[pick[r]];
             if (p == 0ull && rdy != 0u)
                 for (int q = 0; q < pf.cap; ++q)
@@ -1542,6 +1602,19 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                         own |= 1u << r;
                         break;
                     }
+            pp[r] = p;
+            nx += p == 0ull && pf.xtab != nullptr && t == 0 && pf.xtab[pick[r]] != 0ull;
+        }
+        int keep = (int) ceilf((float) nx * pf.xcpu - 1e-4f);   // (the CPU lane's share, the rest pulled)
+        unsigned xown = 0;
+        for (int r = 0; r < k; ++r) {
+            const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            unsigned long long p = pp[r];
+            if (p == 0ull && pf.xtab != nullptr && t == 0 && pf.xtab[pick[r]] != 0ull && keep-- <= 0) {
+                p = (unsigned long long) (pf.xbuf + (size_t) r * pf.xstride);
+                own |= 1u << r;
+                xown |= 1u << r;
+            }
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
             plan_ptr[(size_t) t * kPicks + r] = p;
@@ -1551,7 +1624,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 req->w[t][r] = wv;
             }
         }
-        if (req != nullptr && pfa) {
+        if (req != nullptr && (pfa || (pf.xtab != nullptr && t == 0))) {
             int n = 0;
             for (int q = 0; q < kPfSlots; ++q) {
                 req->pf_plan[q] = lst[q];
@@ -1559,13 +1632,18 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             }
             req->pf_n = n;
             req->pf_own[0] = own;
+            req->pf_xown = xown;
             req->pf_rdy = rdy;
-            req->pf_t[0] = pf.tm[par * 2];
-            req->pf_t[1] = pf.tm[par * 2 + 1];
+            req->pf_t[0] = pfa ? pf.tm[par * 2] : 0ull;
+            req->pf_t[1] = pfa ? pf.tm[par * 2 + 1] : 0ull;
             req->pf_t[2] = globaltimer_ns();
             req->pf_seq = sq;
         }
         on_cpu = cpu;
+        if (pf.xneed != nullptr && t == 0) {
+            *pf.xneed = cpu;
+            if (!cpu && pf.rcpu != nullptr) *(volatile int*) pf.rcpu = 0;
+        }
     }
     // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
     // 20 KB over PCIe, where most windows have none
@@ -1582,9 +1660,8 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     pdl_wait();
     pdl_trigger();
     __shared__ float bs[1024];
-    __shared__ float bv[32];
-    __shared__ int bi[32];
-    __shared__ int nf, stop;
+    __shared__ int tk[32];
+    __shared__ int nf;
     const int t = blockIdx.x;
     const unsigned par = pa.seq & 1u;
     logits += (size_t) t * 1024;
@@ -1600,37 +1677,20 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
         bs[i] = sqrtf(sp) + bias[i];
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const int rmax = pa.gl != nullptr ? min(min(n, kAhead1), m + kPfScanExtra) : m;
-    for (int r = 0; r < rmax; ++r) {
-        float best = -FLT_MAX;
-        int bix = 0x7fffffff;
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
-            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
-        }
-        if (lane == 0) bv[wp] = best, bi[wp] = bix;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float b = -FLT_MAX;
-            int ix = 0x7fffffff;
-            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
-                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+    const int rmax = min(pa.gl != nullptr ? min(min(n, kAhead1), m + kPfScanExtra) : m, 32);
+    if (threadIdx.x < 32) warp_topk(bs, n, rmax, tk, threadIdx.x);
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int r = 0; r < rmax; ++r) {
+            const int ix = tk[r];
             if (r < m) req->ahead[t][off + r] = ix < n ? ix : -1;
-            if (ix < n) bs[ix] = -FLT_MAX;
             if (pa.gl != nullptr && nf < pa.B && ix < n && pa.vram_next[ix] == 0ull && pa.pf_next[ix] != 0ull) {
                 pa.gld[par * kPfSlots + nf] = ix;
                 if (pa.gl != pa.gld) pa.gl[par * kPfSlots + nf] = ix;
                 ++nf;
             }
-            stop = (r + 1 >= m) && (pa.gl == nullptr || nf >= pa.B);
+            if ((r + 1 >= m) && (pa.gl == nullptr || nf >= pa.B)) break;
         }
-        __syncthreads();
-        if (stop) break;
-    }
     if (threadIdx.x == 0 && pa.gl != nullptr) {
         for (int q = nf; q < kPfSlots; ++q) {
             pa.gld[par * kPfSlots + q] = -1;
@@ -2057,6 +2117,19 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) {
     pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq);
 }
+__global__ void wait_seq_if_kernel(const unsigned* seq_ptr, unsigned seq, const int* need) {
+    pdl_wait();
+    if (threadIdx.x != 0 || *(volatile const int*) need == 0) return;
+    while (*(volatile const unsigned*) seq_ptr != seq) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(200);
+#endif
+    }
+    __threadfence_system();
+}
+void wait_seq_if(const unsigned* seq_ptr, unsigned seq, const int* need, cudaStream_t s) {
+    pdl_launch(wait_seq_if_kernel, 1, 32, 0, s, seq_ptr, seq, need);
+}
 
 __device__ __forceinline__ uint4 pf_ld(const uint4* p) {
 #if defined(STRATA_USE_HIP)
@@ -2141,6 +2214,31 @@ void pf_pull(const PfDev& pf, const PfMats& m, unsigned seq, const unsigned long
     pf_pull_kernel<<<blocks, 512, 0, s>>>(pf, m, seq, pf_next);
 }
 
+__global__ void pf_exact_kernel(const unsigned long long* __restrict__ plan, const int* __restrict__ idx,
+                                const unsigned long long* __restrict__ xtab, uint8_t* __restrict__ xbuf, size_t xstride,
+                                PfMats m) {
+    const int i = blockIdx.y;
+    uint8_t* dst = xbuf + (size_t) i * xstride;
+    if (plan[i] != (unsigned long long) dst) return;
+    const uint8_t* src = (const uint8_t*) xtab[idx[i]];
+    for (int r = 0; r < 3; ++r) {
+        const uint4* s4 = (const uint4*) (src + m.soff[r]);
+        uint4* d4 = (uint4*) (dst + m.doff[r]);
+        const size_t n = m.bytes[r] / 16;
+        for (size_t o = (size_t) blockIdx.x * blockDim.x + threadIdx.x; o < n; o += (size_t) gridDim.x * blockDim.x)
+            d4[o] = s4[o];
+    }
+}
+void pf_exact_pull(const unsigned long long* plan, const int* idx, const unsigned long long* xtab, int k, uint8_t* xbuf,
+                   size_t xstride, const PfMats& m, int blocks, cudaStream_t s) {
+    pf_exact_kernel<<<dim3(blocks, k), 256, 0, s>>>(plan, idx, xtab, xbuf, xstride, m);
+}
+__global__ void pf_mark_kernel(unsigned* flag, unsigned seq) {
+    __threadfence_system();
+    *(volatile unsigned*) flag = seq;
+}
+void pf_mark(unsigned* flag, unsigned seq, cudaStream_t s) { pf_mark_kernel<<<1, 1, 0, s>>>(flag, seq); }
+
 // the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds
 // (zc_tab[expert] = the slot's device address over PCIe, 0: not) is copied to staging slot i with wide coalesced loads (the PCIe
 // rate; the expert kernels' own small loads over PCIe ran at a tenth of it), then the plan points at the copy
@@ -2199,6 +2297,12 @@ void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
 void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
                   const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre, float* post,
                   float* comb, cudaStream_t s) {
+    static const bool wide = std::getenv("DS4_HC_WIDE") != nullptr && std::atoi(std::getenv("DS4_HC_WIDE")) != 0;
+    if (wide && T <= kHcT && n_mix <= 32 && hcdim % (kHcS * 4) == 0) {
+        pdl_launch(hc_mix_split_wide_kernel, dim3(n_mix * kHcS, T), kThreads, 0, s, h, fn, hcdim, n_mix, eps, mixes, cnt,
+                   scale, base, hc, iters, hc_eps, pre, post, comb);
+        return;
+    }
     pdl_launch(hc_mix_split_kernel, dim3(n_mix, T), kThreads, 0, s, h, fn, hcdim, eps, mixes, cnt, scale, base, hc,
                iters, hc_eps, pre, post, comb);
 }
@@ -2248,7 +2352,9 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
-    if (T > 0) pdl_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
+    // (two rows a block keep every SM busy; the same sums in the same order)
+    static const int rpb = std::getenv("DS4_GEMV_RPB") ? std::max(1, std::min(8, std::atoi(std::getenv("DS4_GEMV_RPB")))) : 2;
+    if (T > 0) pdl_launch(gemv_f32_kernel, dim3(cdiv(n, rpb), T), rpb * 32, 0, s, W, x, n, k, y, ldy);
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,

@@ -1500,17 +1500,35 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
     }
+    if (s.lane_req > s0.lane_req) {
+        const double calls = (double) (s.lane_calls - s0.lane_calls);
+        std::fprintf(stderr, "CPU lane: %.1f decode requests a token, %.1f with experts to run, %.3f ms a call, %.1f guessed "
+                             "experts read ahead a token\n",
+                     (double) (s.lane_req - s0.lane_req) / nt, calls / nt,
+                     (s.lane_call_ms - s0.lane_call_ms) / std::max(1.0, calls), (double) (s.lane_warm - s0.lane_warm) / nt);
+        std::string bn = "CPU lane calls by experts run (count, ms a call):";
+        for (int i = 0; i < 6; ++i) {
+            const long long c = (long long) (s.lane_by_n[i] - s0.lane_by_n[i]);
+            char b[64];
+            std::snprintf(b, sizeof b, " %d%s %lld %.3f", i + 1, i == 5 ? "+" : "", c,
+                          (s.lane_by_ms[i] - s0.lane_by_ms[i]) / std::max(1.0, (double) c));
+            bn += b;
+        }
+        std::fprintf(stderr, "%s\n", bn.c_str());
+    }
     if (s.pf_req > s0.pf_req) {   // prefetch
         const double rq = (double) (s.pf_req - s0.pf_req), pl = (double) (s.pf_planned - s0.pf_planned);
         const double hit = (double) (s.pf_hit - s0.pf_hit), late = (double) (s.pf_late - s0.pf_late);
         const double ung = (double) (s.pf_unguessed - s0.pf_unguessed), fil = (double) (s.pf_file - s0.pf_file);
-        const double lane = late + ung + fil, blob_mb = 6.912, tm = (double) (s.pf_timed - s0.pf_timed);
+        const double xh = (double) (s.pf_exact - s0.pf_exact);
+        const double lane = late + ung + fil - xh, blob_mb = 6.912, tm = (double) (s.pf_timed - s0.pf_timed);
+        if (xh > 0) std::fprintf(stderr, "prefetch: %.1f picks a token pulled once routed (exact)\n", xh / nt);
         std::fprintf(stderr,
                      "prefetch: %.1f guessed a token, %.1f ready in time, %.1f used (precision %.1f%%, coverage %.1f%% of the "
                      "CPU-lane picks); CPU-lane picks left: %.1f a token (late %.1f, unguessed %.1f, file %.1f); %.1f MB "
                      "pulled and %.1f MB unused a token; %lld ready but not picked, %lld staged blobs checked, %lld differ\n",
                      pl / nt, (double) (s.pf_ready - s0.pf_ready) / nt, hit / nt, 100.0 * hit / std::max(1.0, pl),
-                     100.0 * hit / std::max(1.0, hit + lane), lane / nt, late / nt, ung / nt, fil / nt, pl * blob_mb / nt,
+                     100.0 * hit / std::max(1.0, hit + late + ung + fil), lane / nt, late / nt, ung / nt, fil / nt, pl * blob_mb / nt,
                      (pl - hit) * blob_mb / nt, (long long) (s.pf_wasted_ready - s0.pf_wasted_ready),
                      (long long) (s.pf_checked - s0.pf_checked), (long long) (s.pf_bad - s0.pf_bad));
         std::string pr = "prefetch: picked by the guess's slot (non-VRAM rank, 1 ..):";

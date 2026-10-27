@@ -1019,6 +1019,16 @@ struct Model::Impl {
         // copy engine (default; DS4_PREFETCH_ENGINE=sm: the pull kernel): a host thread copies each list
         const bool sm = std::getenv("DS4_PREFETCH_ENGINE") && std::strcmp(std::getenv("DS4_PREFETCH_ENGINE"), "sm") == 0;
         const bool after_lane = env_i("DS4_PREFETCH_AFTER_LANE", 0) != 0;
+        // DS4_PREFETCH_EXACT=1: every pullable CPU-lane pick of a decode token pulled once routed, the device computes it
+        const bool exact = env_i("DS4_PREFETCH_EXACT", 0) != 0;
+        const int xblocks = std::max(1, env_i("DS4_PREFETCH_XBLOCKS", 16));
+        const float xcpu = std::getenv("DS4_PREFETCH_XCPU") ? (float) std::atof(std::getenv("DS4_PREFETCH_XCPU")) : 0.0f;
+        uint8_t* xbuf = nullptr;
+        unsigned* xdone = nullptr;   // host-mapped: the last request whose exact pull is done
+        int* xneed = nullptr;        // device: the token's CPU-lane need, by route_publish
+        const bool xskip = env_i("DS4_PREFETCH_XSKIP", 0) != 0;
+        cudaStream_t sX = nullptr;
+        cudaEvent_t evX[2] = {nullptr, nullptr};
         unsigned* stamp = nullptr;   // pinned [kRing]: the ready stamps' source, seq at seq % kRing
         std::atomic<int> tgt[kRing];   // seq % kRing -> the layer a list is for
         std::vector<std::vector<unsigned long long>> htab;   // pf_tab on the host
@@ -5810,9 +5820,10 @@ struct Model::Impl {
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        constexpr int RB = 64;   // rows a job
+        static const int RBG = std::getenv("DS4_IQ_RB") ? std::max(16, std::atoi(std::getenv("DS4_IQ_RB"))) : 64;   // rows a job
+        static const int RBD = std::getenv("DS4_IQ_RBD") ? std::max(16, std::atoi(std::getenv("DS4_IQ_RBD"))) : RBG;
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        const int GB = (FFh + RBG - 1) / RBG, DB = (Eh + RBD - 1) / RBD, ne = (int) ents.size();
         gg::IqCpu fm;
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
@@ -5858,7 +5869,7 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                const int r0 = X * FFh + (j % GB) * RBG, r1 = std::min(X * FFh + FFh, r0 + RBG);
                 const void* ap[kEntMax];
                 float* hp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
@@ -5880,7 +5891,7 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                const int r0 = X * Eh + (j % DB) * RBD, r1 = std::min(X * Eh + Eh, r0 + RBD);
                 const void* hp[kEntMax];
                 float* yp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
@@ -6701,7 +6712,7 @@ struct Model::Impl {
                     why = "a matrix is not 16-byte aligned or lies past the blob";
             }
         const int cap = std::min(std::max(0, Prefetch::env_i("DS4_PREFETCH_N", 3)), kPfSlots);
-        if (tl.empty() || cap <= 0) why = "no layer to stage or DS4_PREFETCH_N is 0";
+        if (tl.empty() || (cap <= 0 && !pf.exact)) why = "no layer to stage or DS4_PREFETCH_N is 0";
         if (why != nullptr) {
             std::fprintf(stderr, "ds4: prefetch off: %s\n", why);
             return;
@@ -6710,8 +6721,10 @@ struct Model::Impl {
         pf.dd.stride = stride;
         pf.dd.slots = cap;
         const size_t ns = (size_t) 2 * kPfSlots;
-        bool ok = dalloc(d, pf.dd.buf, (size_t) 2 * cap * stride, err) && dalloc(d, pf.dd.ready, ns, err) && dalloc(d, pf.dd.cnt, ns, err) &&
-                  dalloc(d, pf.dd.tm, 4, err);
+        bool ok = dalloc(d, pf.dd.buf, (size_t) 2 * std::max(cap, 1) * stride, err) && dalloc(d, pf.dd.ready, ns, err) &&
+                  dalloc(d, pf.dd.cnt, ns, err) && dalloc(d, pf.dd.tm, 4, err);
+        if (pf.exact)
+            ok = ok && dalloc(d, pf.xbuf, (size_t) kPicks * stride, err) && hmap(pf.xdone, 1, err) && dalloc(d, pf.xneed, 1, err);
         if (pf.sm) ok = ok && dalloc(d, pf.dd.gl, ns, err) && dalloc(d, pf.dd.gseq, 2, err);
         else
             ok = ok && hmap(pf.dd.gl, ns, err) && hmap(pf.dd.gseq, 2, err) && halloc(pf.stamp, kRing, err) &&
@@ -6736,7 +6749,10 @@ struct Model::Impl {
         int lo = 0, hi = 0;
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         if (cudaStreamCreateWithPriority(&pf.sB, cudaStreamNonBlocking, hi) != cudaSuccess ||
-            cudaEventCreateWithFlags(&pf.ev, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&pf.ev, cudaEventDisableTiming) != cudaSuccess ||
+            (pf.exact && (cudaStreamCreateWithPriority(&pf.sX, cudaStreamNonBlocking, hi) != cudaSuccess ||
+                          cudaEventCreateWithFlags(&pf.evX[0], cudaEventDisableTiming) != cudaSuccess ||
+                          cudaEventCreateWithFlags(&pf.evX[1], cudaEventDisableTiming) != cudaSuccess))) {
             (void) cudaGetLastError();
             std::fprintf(stderr, "ds4: prefetch off: no stream\n");
             pf.dd = PfDev{};
@@ -6758,8 +6774,9 @@ struct Model::Impl {
             pf.run.store(true);
             pf.mover = std::thread([this] { pf_move(); });
         }
-        std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %s, %.0f MB staging\n", pf.mode, cap,
-                     pf.sm ? "pull kernel" : "copy engine", (double) 2 * cap * (double) stride / 1e6);
+        std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %s, %.0f MB staging%s\n", pf.mode, cap,
+                     pf.sm ? "pull kernel" : "copy engine", (double) 2 * cap * (double) stride / 1e6,
+                     pf.exact ? "; exact pull of every pullable pick once routed" : "");
     }
     // the copy engine's thread: each list route_ahead publishes, copied into its staging slots,
     // every expert followed by its ready stamp on the same stream
@@ -6795,6 +6812,12 @@ struct Model::Impl {
         for (int q = 0; q < slots; ++q) lst[q] = *(volatile const int*) &pf.dd.gl[par * kPfSlots + q];
         std::atomic_thread_fence(std::memory_order_acquire);
         if (*(volatile const unsigned*) &pf.dd.gseq[par] != g) return;   // (rewritten while read)
+        if (pf.exact && pf.xdone != nullptr) {   // (the layer before's exact pull done first: no PCIe shared with it)
+            while ((int) (*(volatile const unsigned*) pf.xdone - (g - 1u)) < 0) {
+                if (*(volatile const unsigned*) &pf.dd.gseq[par] != g || !pf.gate.load(std::memory_order_relaxed)) return;
+                cpu_relax();
+            }
+        }
         if (pf.after_lane) {   // (the CPU lane's layer before done first: no DRAM shared with it)
             const Resp& rp = resps[(g - 1u) % kRing];
             while (*(volatile const unsigned*) &rp.seq != g - 1u) {
@@ -7022,7 +7045,8 @@ struct Model::Impl {
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
                             if (pfo) {
-                                if ((r.pf_own[0] >> i) & 1u) {
+                                const bool xo = (r.pf_xown >> i) & 1u;
+                                if (((r.pf_own[0] >> i) & 1u) && !xo) {
                                     ++st.pf_hit;
                                     continue;
                                 }
@@ -7031,6 +7055,10 @@ struct Model::Impl {
                                 if (planned) ++pf_late, ++st.pf_late;
                                 else if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.pf_unguessed;
                                 else ++st.pf_file;
+                                if (xo) {   // (the device pulled it once routed)
+                                    ++st.pf_exact;
+                                    continue;
+                                }
                             }
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
@@ -7113,13 +7141,61 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                    if (T == 1 && !l.mtp) {
+                        const double dt = now_ms() - tc;
+                        const int b = std::min(std::max(nslots, 1), 6) - 1;
+                        ++st.lane_calls;
+                        st.lane_call_ms += dt;
+                        ++st.lane_by_n[b];
+                        st.lane_by_ms[b] += dt;
+                    }
                 }
+                if (T == 1 && !l.mtp) ++st.lane_req;
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+            if (lane_warm > 0 && T == 1) lane_warm_next(li, r);
             ++next;
             last = std::chrono::steady_clock::now();
         }
+    }
+    // DS4_LANE_WARM=B: while the device runs the next layer's attention, the pool reads the B best guessed CPU-lane
+    // experts of that layer (RAM copies, not in VRAM) towards the caches - DS4_LANE_WARM_MODE 1 prefetcht2, 2 loads
+    const int lane_warm = std::getenv("DS4_LANE_WARM") ? std::atoi(std::getenv("DS4_LANE_WARM")) : 0;
+    const int lane_warm_mode = std::getenv("DS4_LANE_WARM_MODE") ? std::atoi(std::getenv("DS4_LANE_WARM_MODE")) : 1;
+    std::vector<std::pair<const uint8_t*, size_t>> warm_parts;
+    void lane_warm_next(int li, const Req& r) {
+        const int j = li + 1, na = std::min(r.na[0], kAhead1);
+        if (li < 0 || j >= g.nl || j >= (int) L.size() || na <= 0 || !copy_mode) return;
+        const Layer& n = L[(size_t) j];
+        if (n.mtp || n.ram.empty()) return;
+        warm_parts.clear();
+        int got = 0;
+        for (int i = 0; i < na && got < lane_warm; ++i) {
+            const int e = r.ahead[0][i];
+            if (e < 0 || e >= n.n_exp || n.slot[(size_t) e] >= 0 || n.ram[(size_t) e] < 0) continue;
+            ++got;
+            for (int q = 0; q < 3; ++q) {
+                const uint8_t* p = mx_part_ptr(n, e, q, 0);
+                const size_t b = mx_part_bytes(n, q);
+                for (size_t o = 0; o < b; o += 64 << 10) warm_parts.push_back({p + o, std::min<size_t>(64 << 10, b - o)});
+            }
+        }
+        if (warm_parts.empty()) return;
+        const int mode = lane_warm_mode;
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X)
+            f[X] = [this, mode](int k) {
+                const auto& pr = warm_parts[(size_t) k];
+                if (mode == 2) {
+                    uint64_t s = 0;
+                    for (size_t o = 0; o < pr.second; o += 64) s += *(const volatile uint8_t*) (pr.first + o);
+                    if (s == 0x5eed) std::fprintf(stderr, " ");
+                } else
+                    for (size_t o = 0; o < pr.second; o += 64) __builtin_prefetch(pr.first + o, 0, 1);
+            };
+        run_nodes((int) warm_parts.size(), f);
+        st.lane_warm += got;
     }
 
     // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
@@ -9602,12 +9678,36 @@ struct Model::Impl {
                                 : PfAhead{});
                 na[a - 1] = m;
             }
+            const bool xp = lead && T == 1 && moe_token_path && pf.exact && pf.live && !l.mtp && l.pf_tab != nullptr &&
+                            (size_t) l.il < pf.pinned.size() && pf.pinned[(size_t) l.il];
+            PfDev rpf = pf.live && pf.armed[(size_t) l.il] ? pd : PfDev{};
+            if (xp) {
+                rpf.xtab = l.pf_tab;
+                rpf.xbuf = pf.xbuf;
+                rpf.xstride = pf.dd.stride;
+                rpf.xcpu = pf.xcpu;
+                if (pf.xskip && l.il != g.nl - 1) {   // (the last layer always waits: the request ring stays bounded)
+                    rpf.xneed = pf.xneed;
+                    rpf.rcpu = &resps[slot].cpu[0];
+                }
+            }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], pf.live && pf.armed[(size_t) l.il] ? pd : PfDev{});
+                          na[1], rpf);
+            if (xp) {   // (beside the shared expert, on a stream of its own)
+                CK(cudaEventRecord(pf.evX[0], s));
+                CK(cudaStreamWaitEvent(pf.sX, pf.evX[0], 0));
+                pf_exact_pull(d.plan_ptr, d.ridx, l.pf_tab, l.k_exp, pf.xbuf, pf.dd.stride, pf.mats[(size_t) l.il],
+                              pf.xblocks, pf.sX);
+                CK(cudaEventRecord(pf.evX[1], pf.sX));
+                pf_mark(pf.xdone, sq, pf.sX);
+            } else if (pf.exact && pf.live && lead && T == 1)
+                pf_mark(pf.xdone, sq, s);
             if (pn != nullptr) {
                 pf.armed[(size_t) pn->il] = 1;   // (mode 2: nothing is pulled)
-                if (pf.sm && pf.mode == 1 && !pf.force_late) {   // (after publish_kernel)
+                if (pf.sm && pf.mode == 1 && !pf.force_late && xp) {   // (behind this layer's exact pull: no PCIe shared)
+                    pf_pull(pd, pf.mats[(size_t) pn->il], wp.seq[pn->il], pn->pf_tab, pf.blocks, pf.sX);
+                } else if (pf.sm && pf.mode == 1 && !pf.force_late) {   // (after publish_kernel)
                     CK(cudaEventRecord(pf.ev, s));
                     CK(cudaStreamWaitEvent(pf.sB, pf.ev, 0));
                     pf_pull(pd, pf.mats[(size_t) pn->il], wp.seq[pn->il], pn->pf_tab, pf.blocks, pf.sB);
@@ -9630,12 +9730,14 @@ struct Model::Impl {
                 ma.n_ff = FF;
                 ma.limit = g.lim;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
+                if (xp) CK(cudaStreamWaitEvent(s, pf.evX[1], 0));
                 if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 prof_mark(d, 3);
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && rpf.xneed != nullptr) wait_seq_if(&resps[slot].seq, sq, rpf.xneed, s);
+                else if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);

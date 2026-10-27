@@ -94,6 +94,12 @@ struct Stats {
     int64_t pf_req = 0, pf_planned = 0, pf_ready = 0, pf_hit = 0, pf_late = 0, pf_unguessed = 0, pf_file = 0;
     int64_t pf_wasted_ready = 0, pf_bad = 0, pf_checked = 0, pf_timed = 0, pf_pull_ns = 0, pf_slack_ns = 0;
     int64_t pf_rank_n[8] = {}, pf_rank_hit[8] = {};
+    int64_t pf_exact = 0;                   // picks the device pulled once routed (DS4_PREFETCH_EXACT)
+    int64_t lane_warm = 0;                  // guessed CPU-lane experts read ahead towards the caches (DS4_LANE_WARM)
+    int64_t lane_req = 0, lane_calls = 0;   // decode route requests to the CPU lane, those with experts to run
+    double lane_call_ms = 0.0;              // those calls' time
+    int64_t lane_by_n[6] = {};              // those calls by experts run (1 .. 5, 6+), and their time
+    double lane_by_ms[6] = {};
     // the RAM store (--ssd-cache), totals since the load: reads asked for and found there (hits), missed (misses), started ahead
     // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
     int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;

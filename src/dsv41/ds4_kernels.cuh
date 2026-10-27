@@ -230,6 +230,12 @@ struct PfDev {
     int slots = 0;                        // staging slots a parity holds
     int cap = 0;                          // slots in use (<= slots)
     unsigned long long* tm = nullptr;     // [2][2] globaltimer: pull begin, pull end
+    const unsigned long long* xtab = nullptr;   // exact pull: this layer's pullable RAM copies (0: none), else off
+    uint8_t* xbuf = nullptr;                    // [kPicks][xstride]: a pick's staging slot for the exact pull
+    size_t xstride = 0;
+    float xcpu = 0.0f;                          // the share of the pullable CPU-lane picks left to it (rounded up)
+    int* xneed = nullptr;   // device: 1 when a pick of the token is the CPU lane's (wait_seq_if waits only then)
+    int* rcpu = nullptr;    // host-mapped: the response's cpu flag, cleared here when the lane has nothing
 };
 struct PfAhead {
     const unsigned long long *vram_next = nullptr, *pf_next = nullptr;
@@ -253,6 +259,7 @@ struct Req {
     float x[kWin][kMaxDim];
     unsigned pf_seq;               // prefetch: == seq when the fields below are this request's
     unsigned pf_own[kWin];         // bit i: pick i is staged (the CPU lane leaves it out)
+    unsigned pf_xown;              // of pf_own[0], the bits of the exact pull (the rest from prefetch slots)
     int pf_n;                      // guesses planned (pf_plan[0 .. pf_n))
     int pf_plan[kPfSlots];         // the guessed experts by staging slot
     unsigned pf_rdy;               // bit s: slot s was complete at the routing
@@ -279,6 +286,13 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 /// (pf_next[expert]) into the staging slots, each complete once its ready stamp equals seq.
 void pf_pull(const PfDev& pf, const PfMats& m, unsigned seq, const unsigned long long* pf_next, int blocks,
              cudaStream_t s);
+/// The exact pull: the k picks route_publish pointed at their xbuf slot, copied there from their RAM copies.
+void pf_exact_pull(const unsigned long long* plan, const int* idx, const unsigned long long* xtab, int k, uint8_t* xbuf,
+                   size_t xstride, const PfMats& m, int blocks, cudaStream_t s);
+/// seq into host-mapped *flag once the stream gets there (the exact pull of request seq done).
+void pf_mark(unsigned* flag, unsigned seq, cudaStream_t s);
+/// wait_seq, skipped when *need is 0 (the CPU lane has no pick of this request).
+void wait_seq_if(const unsigned* seq_ptr, unsigned seq, const int* need, cudaStream_t s);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,
