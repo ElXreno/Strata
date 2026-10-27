@@ -6451,15 +6451,19 @@ struct Model::Impl {
     void serve_lane() {
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        bool doze = false;
         std::vector<Ent> ents;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                if (!doze && (++spins & 1023u) == 0)
+                    doze = std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2);
+                if (doze) std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
+            doze = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];

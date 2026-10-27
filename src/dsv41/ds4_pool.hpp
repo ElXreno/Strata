@@ -97,11 +97,13 @@ private:
         uint64_t seen = gen_.load();
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
+            uint32_t spins = 0;
             uint64_t g;
             for (;;) {
                 g = gen_.load(std::memory_order_acquire);
                 if (g != seen || quit_.load(std::memory_order_relaxed)) break;
                 cpu_relax();
+                if ((++spins & 1023u) != 0) continue;
                 if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
                     std::unique_lock<std::mutex> lk(mu_);
                     sleeping_.fetch_add(1);
