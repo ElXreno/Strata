@@ -6049,6 +6049,40 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
+        static const bool flow = std::getenv("DS4_LANE_FLOW") != nullptr && std::atoi(std::getenv("DS4_LANE_FLOW")) != 0;
+        if (flow && NH == 1) {   // no barrier: an entry's down rows open once its gate/up rows are done
+            struct alignas(64) Left { std::atomic<int> v{0}; };
+            std::vector<Left> left((size_t) ne);
+            for (int x = 0; x < ne; ++x) left[(size_t) x].v.store(GB, std::memory_order_relaxed);
+            const int ngu = ne * GB;
+            std::function<void(int)> g1[1];
+            g1[0] = [&](int j) {
+                if (j < ngu) {
+                    f[0](j);
+                    const int x = j / GB;
+                    if (left[(size_t) x].v.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+                    const Ent& en = ents[(size_t) (ord != nullptr ? ord[x] : x)];
+                    for (int i = 0; i < en.n; ++i)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                    left[(size_t) x].v.store(-1, std::memory_order_release);
+                    return;
+                }
+                const int jd = j - ngu, x = jd / DB;
+                while (left[(size_t) x].v.load(std::memory_order_acquire) != -1) cpu_relax();
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[x] : x)];
+                const int r0 = (jd % DB) * RB, r1 = std::min(Eh, r0 + RB);
+                const void* hp[kEntMax];
+                float* yp[kEntMax];
+                for (int i = 0; i < en.n; ++i) {
+                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E;
+                }
+                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, 0), hp, en.n, yp, r0, r1);
+            };
+            run_nodes(ngu + ne * DB, g1);
+            return;
+        }
         run_nodes(ne * GB, f);
         const double tp2 = now_ms();
         for (const Ent& en : ents)
