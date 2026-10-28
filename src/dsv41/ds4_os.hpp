@@ -187,6 +187,7 @@ inline fd_t open_par(const std::string& path) {
     return h == INVALID_HANDLE_VALUE ? kBadFd : (fd_t) h;
 #else
     const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);   // (whole matrices a read: no readahead past them)
     return fd < 0 ? kBadFd : (fd_t) fd;
 #endif
 }

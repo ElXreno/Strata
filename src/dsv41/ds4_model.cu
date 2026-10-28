@@ -8473,14 +8473,18 @@ struct Model::Impl {
                 lc_bytes = std::min<uint64_t>(need, avail > kRamMargin + state_b ? avail - kRamMargin - state_b : 0);
         }
         if (lc_bytes < blob_max) return false;
+        // huge pages only while free 2 MiB blocks cover them (each prompt's fresh mapping compacted otherwise)
+        const char* thp_env = std::getenv("DS4_ANON_THP");
+        const uint64_t huge_free = os::free_huge_bytes();
+        const bool lm_thp = thp_env != nullptr ? std::atoi(thp_env) != 0 : huge_free / 5 * 4 >= state_b + lc_bytes;
         void* st_p = nullptr;
         c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
         if (!c.lm_pinned) {
             cudaGetLastError();
-            st_p = os::anon_alloc(state_b, -1, 1);
+            st_p = os::anon_alloc(state_b, -1, 1, lm_thp);
             if (st_p == nullptr) return false;
         }
-        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1);
+        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1, lm_thp);
         if (c.lc == nullptr) {
             if (c.lm_pinned) cudaFreeHost(st_p);
             else os::anon_free(st_p, state_b);
