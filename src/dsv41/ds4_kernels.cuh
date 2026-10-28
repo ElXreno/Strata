@@ -273,10 +273,24 @@ struct Resp {
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
+/// A verify window's pull (DS4_WIN_PULL_N): up to n CPU-lane experts with a pinned RAM copy
+struct WinSel {
+    const unsigned long long* xtab = nullptr;
+    uint8_t* xbuf = nullptr;
+    size_t xstride = 0;
+    int n = 0;
+    int* sel = nullptr;   // device [kPicks]: the experts pulled into xbuf slot j (-1: none)
+    // (copy engine) host-mapped: each slot's source address (0: none), then seq for the host's mover
+    unsigned long long* hsrc = nullptr;
+    unsigned* hseq = nullptr;
+};
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0, PfDev pf = {});
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, PfDev pf = {}, const WinSel* ws = nullptr);
+/// The window pull: the chosen experts copied from their RAM copies into their xbuf slots.
+void win_pull(const int* sel, const unsigned long long* xtab, uint8_t* xbuf, size_t xstride, const PfMats& m, int n,
+              int blocks, cudaStream_t s);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 /// pa.gl: also the best pa.B guesses that are not in VRAM but pullable, by rank.

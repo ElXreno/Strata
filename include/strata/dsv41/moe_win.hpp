@@ -27,6 +27,9 @@ struct MoeWin {
     int T = 0, k = 0, n_embd = 0, n_ff = 0;
     float limit = 0.0f;
     size_t down_off = 0;
+    // which plan pointers are grouped: 0 all, 1 those outside [lo, hi), 2 those inside
+    int only = 0;
+    unsigned long long lo = 0, hi = 0;
 };
 constexpr int kMaxWinTokens = kMaxMvCols;   // the window's tokens moe_win_experts groups (16 x 8 entries)
 void moe_win_group(const MoeWin& w, cudaStream_t s);

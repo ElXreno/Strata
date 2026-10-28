@@ -1394,12 +1394,16 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hq = sc->hq;
         ia.hd = sc->hd;
     }
-    q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+    if (a.phase != 2) q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
     if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
     else iq::gate_up(ia, groups, a.T, s);
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
+    if (a.phase == 1) {
+        check("win_experts");
+        return true;
+    }
     if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;

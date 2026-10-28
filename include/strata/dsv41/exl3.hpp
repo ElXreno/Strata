@@ -134,6 +134,9 @@ struct WinArgs {
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;
     unsigned wait_val = 0;
+    // 0 the whole pass; 1 the experts only (no wait, no combine);
+    // 2 the experts on the inputs phase 1 quantized, then the wait and the combine
+    int phase = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does

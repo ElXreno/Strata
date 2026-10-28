@@ -2100,12 +2100,97 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }
 }  // namespace
 
+// a window's pull: of its CPU-lane picks with a pinned RAM copy, the n experts with the most tokens
+// get xbuf slots (every pick of them points there and leaves the lane)
+__global__ void win_select_kernel(unsigned long long* plan, const int* idx, int T, int k, const unsigned long long* xtab,
+                                  uint8_t* xbuf, size_t xstride, int n, Req* req, unsigned seq, int* sel,
+                                  unsigned long long* hsrc, unsigned* hseq) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ int se[kWin * kPicks], ssel[kPicks], sm;
+    const int ne = T * kPicks, tid = threadIdx.x;
+    for (int i = tid; i < ne; i += blockDim.x) {
+        const int e = i % kPicks < k ? idx[i] : -1;
+        se[i] = e >= 0 && plan[i] == 0 && xtab[e] != 0 ? e : -1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int es[kWin * kPicks], cnt[kWin * kPicks], nd = 0;
+        for (int i = 0; i < ne; ++i) {
+            const int e = se[i];
+            if (e < 0) continue;
+            int q = 0;
+            while (q < nd && es[q] != e) ++q;
+            if (q == nd) {
+                es[nd] = e;
+                cnt[nd++] = 0;
+            }
+            ++cnt[q];
+        }
+        int m = 0;
+        for (; m < n && m < kPicks; ++m) {
+            int b = -1;
+            for (int q = 0; q < nd; ++q)
+                if (cnt[q] > 0 && (b < 0 || cnt[q] > cnt[b] || (cnt[q] == cnt[b] && es[q] < es[b]))) b = q;
+            if (b < 0) break;
+            ssel[m] = es[b];
+            cnt[b] = 0;
+        }
+        sm = m;
+        for (int q = 0; q < kPicks; ++q) sel[q] = q < m ? ssel[q] : -1;
+        if (hseq != nullptr) {   // (the host's mover copies them: their sources, then seq)
+            for (int q = 0; q < kPicks; ++q) hsrc[q] = q < m ? xtab[ssel[q]] : 0ull;
+            __threadfence_system();
+            *(volatile unsigned*) hseq = seq;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < ne; i += blockDim.x) {
+        const int e = se[i];
+        for (int j = 0; e >= 0 && j < sm; ++j)
+            if (ssel[j] == e) {
+                plan[i] = (unsigned long long) (xbuf + (size_t) j * xstride);
+                se[i] = -2 - j;
+            }
+    }
+    __syncthreads();
+    for (int t = tid; t < T; t += blockDim.x) {
+        unsigned own = 0;
+        for (int r = 0; r < k; ++r) own |= (se[t * kPicks + r] <= -2 ? 1u : 0u) << r;
+        req->pf_own[t] = own;
+    }
+    if (tid == 0) {
+        req->pf_xown = 0;
+        req->pf_seq = seq;
+    }
+}
+__global__ void win_pull_kernel(const int* __restrict__ sel, const unsigned long long* __restrict__ xtab,
+                                uint8_t* __restrict__ xbuf, size_t xstride, PfMats m) {
+    const int j = blockIdx.y, e = sel[j];
+    if (e < 0) return;
+    const uint8_t* src = (const uint8_t*) xtab[e];
+    uint8_t* dst = xbuf + (size_t) j * xstride;
+    for (int r = 0; r < 3; ++r) {
+        const uint4* s4 = (const uint4*) (src + m.soff[r]);
+        uint4* d4 = (uint4*) (dst + m.doff[r]);
+        const size_t nb = m.bytes[r] / 16;
+        for (size_t o = (size_t) blockIdx.x * blockDim.x + threadIdx.x; o < nb; o += (size_t) gridDim.x * blockDim.x)
+            d4[o] = s4[o];
+    }
+}
+void win_pull(const int* sel, const unsigned long long* xtab, uint8_t* xbuf, size_t xstride, const PfMats& m, int n,
+              int blocks, cudaStream_t s) {
+    if (n > 0) win_pull_kernel<<<dim3(blocks, std::min(n, kPicks)), 256, 0, s>>>(sel, xtab, xbuf, xstride, m);
+}
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, PfDev pf) {
+                   unsigned vl, int na0, int na1, PfDev pf, const WinSel* ws) {
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, T == 1 ? pf : PfDev{}, seq);
+    if (ws != nullptr && req != nullptr && T > 1 && T <= kWin && k <= kPicks && ws->n > 0)
+        pdl_launch(win_select_kernel, 1, 128, 0, s, plan_ptr, (const int*) idx, T, k, ws->xtab, ws->xbuf, ws->xstride,
+                   ws->n, req, seq, ws->sel, ws->hsrc, ws->hseq);
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,

@@ -506,6 +506,8 @@ struct Dev {
     unsigned* hand_flag = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
+    unsigned long long* grp2_ptr = nullptr;   // (a window's pulled experts, grouped apart)
+    int *grp2_start = nullptr, *grp2_ent = nullptr, *n_groups2 = nullptr;
 };
 
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
@@ -1022,6 +1024,20 @@ struct Model::Impl {
         const bool after_lane = env_i("DS4_PREFETCH_AFTER_LANE", 0) != 0;
         // DS4_PREFETCH_EXACT=1: every pullable CPU-lane pick of a decode token pulled once routed, the device computes it
         const bool exact = env_i("DS4_PREFETCH_EXACT", 0) != 0;
+        // DS4_WIN_PULL_N=n: a verify window's n CPU-lane experts with the most tokens pulled to the device
+        const int win_n = std::min(std::max(0, env_i("DS4_WIN_PULL_N", 0)), kPicks);
+        int* wsel = nullptr;
+        // DS4_WIN_PULL_CE=1: those experts copied by the copy engine (a host thread, as the prefetch's mover)
+        const bool win_ce = env_i("DS4_WIN_PULL_CE", 0) != 0;
+        unsigned long long* whsrc = nullptr;   // host-mapped [kPicks]
+        unsigned* whseq = nullptr;             // host-mapped
+        unsigned* wdone = nullptr;             // device: the last seq whose copies landed
+        unsigned* wstamp = nullptr;            // pinned [kRing]
+        cudaStream_t sW = nullptr;
+        std::thread wmover;
+        std::atomic<bool> wrun{false};
+        int64_t wlists = 0, wcopies = 0;
+        int64_t win_pulls = 0;
         const int xblocks = std::max(1, env_i("DS4_PREFETCH_XBLOCKS", 16));
         const float xcpu = std::getenv("DS4_PREFETCH_XCPU") ? (float) std::atof(std::getenv("DS4_PREFETCH_XCPU")) : 0.0f;
         uint8_t* xbuf = nullptr;
@@ -1316,6 +1332,8 @@ struct Model::Impl {
         if (ram_th.joinable()) ram_th.join();
         pf.run.store(false);
         if (pf.mover.joinable()) pf.mover.join();
+        pf.wrun.store(false);
+        if (pf.wmover.joinable()) pf.wmover.join();
         if (pf.sB != nullptr) {
             cudaSetDevice(devs[0].id);
             cudaStreamSynchronize(pf.sB);
@@ -2391,7 +2409,8 @@ struct Model::Impl {
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
             if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hccnt, kWin, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
                 !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
-                !dalloc(d, d.n_groups, 4, err))
+                !dalloc(d, d.n_groups, 4, err) || !dalloc(d, d.grp2_ptr, P, err) || !dalloc(d, d.grp2_start, P + 1, err) ||
+                !dalloc(d, d.grp2_ent, P, err) || !dalloc(d, d.n_groups2, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
             if (g.n_mtp > 0 && (int) di == head_dev &&
@@ -2878,6 +2897,7 @@ struct Model::Impl {
         calibrate_paths();
         la_load();
         pf_init();
+        if (std::getenv("DS4_WIN_SKIP_DMA") != nullptr && std::atoi(std::getenv("DS4_WIN_SKIP_DMA")) != 0) (void) emu_ready();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
@@ -6742,7 +6762,7 @@ struct Model::Impl {
 #else
         if (!copy_mode) why = "the CPU lane's experts are not copied into RAM (--mmap-experts off)";
         else if (NH != 1 || devs.size() != 1 || L.empty() || L[0].nm != 1) why = "it needs one device, one RAM part";
-        else if (store_gb_now() > 0.0 || ram_tier) why = "the RAM store or tier is on";
+        else if ((store_gb_now() > 0.0 && pf.win_n <= 0) || ram_tier) why = "the RAM store or tier is on";
         else if (cudaDeviceGetAttribute(&reg_ok, cudaDevAttrHostRegisterSupported, devs[0].id) != cudaSuccess || !reg_ok)
             why = "the driver cannot register host memory";
 #endif
@@ -6772,7 +6792,7 @@ struct Model::Impl {
                     why = "a matrix is not 16-byte aligned or lies past the blob";
             }
         const int cap = std::min(std::max(0, Prefetch::env_i("DS4_PREFETCH_N", 3)), kPfSlots);
-        if (tl.empty() || (cap <= 0 && !pf.exact)) why = "no layer to stage or DS4_PREFETCH_N is 0";
+        if (tl.empty() || (cap <= 0 && !pf.exact && pf.win_n <= 0)) why = "no layer to stage or DS4_PREFETCH_N is 0";
         if (why != nullptr) {
             std::fprintf(stderr, "ds4: prefetch off: %s\n", why);
             return;
@@ -6783,8 +6803,12 @@ struct Model::Impl {
         const size_t ns = (size_t) 2 * kPfSlots;
         bool ok = dalloc(d, pf.dd.buf, (size_t) 2 * std::max(cap, 1) * stride, err) && dalloc(d, pf.dd.ready, ns, err) &&
                   dalloc(d, pf.dd.cnt, ns, err) && dalloc(d, pf.dd.tm, 4, err);
-        if (pf.exact)
+        if (pf.exact || pf.win_n > 0)
             ok = ok && dalloc(d, pf.xbuf, (size_t) kPicks * stride, err) && hmap(pf.xdone, 1, err) && dalloc(d, pf.xneed, 1, err);
+        if (pf.win_n > 0) ok = ok && dalloc(d, pf.wsel, kPicks, err);
+        if (pf.win_n > 0 && pf.win_ce)
+            ok = ok && hmap(pf.whsrc, kPicks, err) && hmap(pf.whseq, 1, err) && dalloc(d, pf.wdone, 1, err) &&
+                 halloc(pf.wstamp, kRing, err);
         if (pf.sm) ok = ok && dalloc(d, pf.dd.gl, ns, err) && dalloc(d, pf.dd.gseq, 2, err);
         else
             ok = ok && hmap(pf.dd.gl, ns, err) && hmap(pf.dd.gseq, 2, err) && halloc(pf.stamp, kRing, err) &&
@@ -6810,7 +6834,7 @@ struct Model::Impl {
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         if (cudaStreamCreateWithPriority(&pf.sB, cudaStreamNonBlocking, hi) != cudaSuccess ||
             cudaEventCreateWithFlags(&pf.ev, cudaEventDisableTiming) != cudaSuccess ||
-            (pf.exact && (cudaStreamCreateWithPriority(&pf.sX, cudaStreamNonBlocking, hi) != cudaSuccess ||
+            ((pf.exact || pf.win_n > 0) && (cudaStreamCreateWithPriority(&pf.sX, cudaStreamNonBlocking, hi) != cudaSuccess ||
                           cudaEventCreateWithFlags(&pf.evX[0], cudaEventDisableTiming) != cudaSuccess ||
                           cudaEventCreateWithFlags(&pf.evX[1], cudaEventDisableTiming) != cudaSuccess))) {
             (void) cudaGetLastError();
@@ -6837,9 +6861,72 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: prefetch: mode %d, up to %d experts a layer, %s, %.0f MB staging%s\n", pf.mode, cap,
                      pf.sm ? "pull kernel" : "copy engine", (double) 2 * cap * (double) stride / 1e6,
                      pf.exact ? "; exact pull of every pullable pick once routed" : "");
+        if (pf.win_n > 0 && pf.win_ce) {
+            int lo2 = 0, hi2 = 0;
+            cudaDeviceGetStreamPriorityRange(&lo2, &hi2);
+            if (cudaStreamCreateWithPriority(&pf.sW, cudaStreamNonBlocking, hi2) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "ds4: prefetch: DS4_WIN_PULL_CE: no stream, the pull kernel instead\n");
+            } else {
+                cudaMemset(pf.wdone, 0, sizeof(unsigned));
+                *(volatile unsigned*) pf.whseq = 0u;
+                pf.wrun.store(true);
+                pf.wmover = std::thread([this] { win_move(); });
+            }
+        }
+        if (pf.win_n > 0)
+            std::fprintf(stderr, "ds4: prefetch: verify windows pull %d CPU-lane experts a layer (%s)\n", pf.win_n,
+                         pf.wrun.load() ? "copy engine" : "pull kernel");
     }
     // the copy engine's thread: each list route_ahead publishes, copied into its staging slots,
     // every expert followed by its ready stamp on the same stream
+    // DS4_WIN_PULL_CE: each window layer's chosen experts (sources from win_select) copied into their xbuf slots,
+    // then seq into wdone on the same stream (the device waits for it before those experts)
+    void win_move() {
+        cudaSetDevice(devs[0].id);
+        unsigned last = 0;
+        while (pf.wrun.load(std::memory_order_relaxed)) {
+            const unsigned g = *(volatile const unsigned*) pf.whseq;
+            if (g == 0u || g == last) {
+                cpu_relax();
+                continue;
+            }
+            last = g;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const int li = layer_of[g % kRing].load(std::memory_order_acquire);
+            if (li >= 0 && li < (int) L.size()) {
+                const PfMats& m = pf.mats[(size_t) li];
+                const bool whole = m.soff[1] - m.soff[0] == m.doff[1] - m.doff[0] &&
+                                   m.soff[2] - m.soff[0] == m.doff[2] - m.doff[0];
+                const size_t span = m.soff[2] + m.bytes[2] - m.soff[0];
+                for (int j = 0; j < kPicks; ++j) {
+                    const unsigned long long src = *(volatile const unsigned long long*) &pf.whsrc[j];
+                    if (src == 0ull) continue;
+                    uint8_t* dst = pf.xbuf + (size_t) j * pf.dd.stride;
+                    if (whole)
+                        cudaMemcpyAsync(dst + m.doff[0], (const void*) (src + m.soff[0]), span, cudaMemcpyHostToDevice, pf.sW);
+                    else
+                        for (int r = 0; r < 3; ++r)
+                            cudaMemcpyAsync(dst + m.doff[r], (const void*) (src + m.soff[r]), m.bytes[r],
+                                            cudaMemcpyHostToDevice, pf.sW);
+                    ++pf.wcopies;
+                }
+            }
+            pf.wstamp[g % kRing] = g;
+            const cudaError_t ce = cudaMemcpyAsync(pf.wdone, pf.wstamp + g % kRing, sizeof(unsigned), cudaMemcpyHostToDevice, pf.sW);
+            ++pf.wlists;
+            static const bool dbg = std::getenv("DS4_WIN_CE_DEBUG") != nullptr;
+            if (dbg && pf.wlists <= 3) {
+                cudaError_t q = cudaErrorNotReady;
+                const double t0 = now_ms();
+                while ((q = cudaStreamQuery(pf.sW)) == cudaErrorNotReady && now_ms() - t0 < 500.0) cpu_relax();
+                std::fprintf(stderr, "win_move: seq %u layer %d, stamp %s, after %.2f ms the stream: %s\n", g, li,
+                             cudaGetErrorString(ce), now_ms() - t0, cudaGetErrorString(q));
+            }
+        }
+        std::fprintf(stderr, "ds4: prefetch: the window copy engine took %lld lists, %lld experts\n",
+                     (long long) pf.wlists, (long long) pf.wcopies);
+    }
     void pf_move() {
         cudaSetDevice(devs[0].id);
         unsigned done[2] = {0, 0};
@@ -7020,6 +7107,110 @@ struct Model::Impl {
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
+    // (tests) DS4_WIN_SKIP_N=n: a verify window's n RAM-copy experts with the most tokens left out of the CPU lane
+    // (wrong outputs: what pulling them to the GPU could take off the lane); the window census every 2000 layers
+    static constexpr int kEmuSlots = 8;
+    static constexpr size_t kEmuStride = (size_t) 8 << 20;
+    cudaStream_t emu_st = nullptr;
+    uint8_t* emu_buf = nullptr;
+    static constexpr int kEmuEv = 256;
+    cudaEvent_t emu_ev[kEmuEv][2] = {};
+    uint8_t emu_used[kEmuEv] = {};
+    int64_t emu_n = 0, emu_done = 0, emu_late = 0;
+    double emu_ms = 0.0;
+    int emu_state = 0;   // 0 not tried, 1 ready, -1 failed
+    bool emu_ready() {   // (at load: no GPU work runs yet) the copy arena pinned, a stream and a device buffer
+        if (emu_state != 0) {
+            if (emu_state > 0) cudaSetDevice(devs[0].id);
+            return emu_state > 0;
+        }
+        emu_state = -1;
+        cudaSetDevice(devs[0].id);
+        if (cudaStreamCreateWithFlags(&emu_st, cudaStreamNonBlocking) != cudaSuccess) return false;
+        if (cudaMalloc(&emu_buf, kEmuSlots * kEmuStride) != cudaSuccess) return false;
+        for (auto& e : emu_ev)
+            if (cudaEventCreate(&e[0]) != cudaSuccess || cudaEventCreate(&e[1]) != cudaSuccess) return false;
+        const double t0 = now_ms();
+        size_t pinned = 0;
+        for (size_t i = 0; i < ram_chunks.size() && i < ram_chunk_bytes.size(); ++i)
+            if (cudaHostRegister(ram_chunks[i], ram_chunk_bytes[i], cudaHostRegisterPortable) == cudaSuccess) pinned += ram_chunk_bytes[i];
+            else cudaGetLastError();
+        std::fprintf(stderr, "ds4: DS4_WIN_SKIP_DMA: %.1f GB of copies pinned in %.1f s\n", pinned / 1e9, (now_ms() - t0) / 1000.0);
+        emu_state = 1;
+        return true;
+    }
+    void win_census_skip(const Layer& l, int T, std::vector<std::pair<int, int>>& picks) {
+        static const int skip_n = std::getenv("DS4_WIN_SKIP_N") ? std::atoi(std::getenv("DS4_WIN_SKIP_N")) : 0;
+        static int64_t n_lay = 0, n_dist = 0, n_ram = 0, n_picks = 0, n_skip = 0, hist[9] = {}, th[17] = {};
+        ++th[std::min(T, 16)];
+        std::vector<std::pair<int, int>> cnt;
+        int dist = 0, ram = 0;
+        for (size_t a = 0; a < picks.size();) {
+            size_t b = a;
+            while (b < picks.size() && picks[b].first == picks[a].first) ++b;
+            const int e = picks[a].first;
+            ++dist;
+            if (!l.ram.empty() && l.ram[(size_t) e] >= 0) {
+                ++ram;
+                cnt.push_back({(int) (b - a), e});
+            }
+            a = b;
+        }
+        ++n_lay;
+        n_dist += dist;
+        n_ram += ram;
+        n_picks += (int64_t) picks.size();
+        ++hist[std::min(ram, 8)];
+        if (skip_n > 0 && !cnt.empty()) {
+            std::sort(cnt.begin(), cnt.end(), [](const std::pair<int, int>& x, const std::pair<int, int>& y) {
+                return x.first != y.first ? x.first > y.first : x.second < y.second;
+            });
+            const int k = std::min(skip_n, (int) cnt.size());
+            std::vector<int> drop;
+            for (int j = 0; j < k; ++j) drop.push_back(cnt[(size_t) j].second);
+            static const bool dma = std::getenv("DS4_WIN_SKIP_DMA") != nullptr && std::atoi(std::getenv("DS4_WIN_SKIP_DMA")) != 0;
+            if (dma && emu_ready()) {   // the dropped experts' copies over PCIe (timed by events, never waited for)
+                const int q = (int) (emu_n++ % kEmuEv);
+                if (emu_used[q]) {
+                    float ms = 0.0f;
+                    if (cudaEventQuery(emu_ev[q][1]) == cudaSuccess && cudaEventElapsedTime(&ms, emu_ev[q][0], emu_ev[q][1]) == cudaSuccess) {
+                        emu_ms += ms;
+                        ++emu_done;
+                    } else {
+                        cudaGetLastError();
+                        ++emu_late;
+                    }
+                }
+                emu_used[q] = 1;
+                cudaEventRecord(emu_ev[q][0], emu_st);
+                for (int j = 0; j < k && j < kEmuSlots; ++j)
+                    for (int r = 0; r < 3; ++r)
+                        cudaMemcpyAsync(emu_buf + (size_t) j * kEmuStride + cp_lay[(size_t) l.il][(size_t) r],
+                                        mx_part_ptr(l, drop[(size_t) j], r, 0), mx_part_bytes(l, r), cudaMemcpyHostToDevice,
+                                        emu_st);
+                cudaEventRecord(emu_ev[q][1], emu_st);
+            }
+            picks.erase(std::remove_if(picks.begin(), picks.end(),
+                                       [&](const std::pair<int, int>& p) {
+                                           return std::find(drop.begin(), drop.end(), p.first) != drop.end();
+                                       }),
+                        picks.end());
+            n_skip += k;
+        }
+        if (n_lay % 2000 == 0) {
+            const double d = (double) n_lay;
+            std::fprintf(stderr, "win census: %lld window layers, %.2f distinct CPU-lane experts a layer (%.2f with a RAM "
+                                 "copy), %.2f picks, %.2f skipped; layers by RAM-copy experts 0..8+:",
+                         (long long) n_lay, n_dist / d, n_ram / d, n_picks / d, n_skip / d);
+            for (int i = 0; i <= 8; ++i) std::fprintf(stderr, " %.0f%%", 100.0 * (double) hist[i] / d);
+            std::fprintf(stderr, "; window T 2..16:");
+            for (int i = 2; i <= 16; ++i) std::fprintf(stderr, " %.0f%%", 100.0 * (double) th[i] / d);
+            if (emu_n > 0)
+                std::fprintf(stderr, "; DMA %.3f ms a layer (%lld timed, %lld not done by the next)",
+                             emu_done ? emu_ms / (double) emu_done : 0.0, (long long) emu_done, (long long) emu_late);
+            std::fprintf(stderr, "\n");
+        }
+    }
     void serve_lane() {
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
@@ -7084,6 +7275,7 @@ struct Model::Impl {
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 // prefetch: the picks the device staged (pf_own) are left out
                 const bool pfo = T == 1 && r.pf_seq == next;
+                const bool wpo = T > 1 && pf.win_n > 0 && r.pf_seq == next;   // (a window's pulled experts)
                 int pf_late = 0;
                 for (int t = 0; t < T; ++t) {
                     float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
@@ -7105,6 +7297,10 @@ struct Model::Impl {
                         if (pfo && pf.check && l.slot[(size_t) e] >= 0 && ((r.pf_own[0] >> i) & 1u)) ++st.pf_bad;
                         if (l.slot[(size_t) e] < 0) {
                             l.cpu_hits.push_back(e);
+                            if (wpo && ((r.pf_own[t] >> i) & 1u)) {
+                                ++st.pf_exact;
+                                continue;
+                            }
                             if (pfo) {
                                 const bool xo = (r.pf_xown >> i) & 1u;
                                 if (((r.pf_own[0] >> i) & 1u) && !xo) {
@@ -7152,6 +7348,7 @@ struct Model::Impl {
                 if (pfo) pf_count(r, l, pf_late);
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 std::sort(picks.begin(), picks.end());
+                if (T > 1 && !l.mtp) win_census_skip(l, T, picks);
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
                     en.e = picks[a].first;
@@ -7186,6 +7383,7 @@ struct Model::Impl {
                 if (!ents.empty()) {
                     const double tc = now_ms();
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -9753,9 +9951,31 @@ struct Model::Impl {
                     rpf.rcpu = &resps[slot].cpu[0];
                 }
             }
+            const bool wpull = lead && T > 1 && pf.ok && pf.win_n > 0 && !l.mtp && l.pf_tab != nullptr &&
+                               (size_t) l.il < pf.pinned.size() && pf.pinned[(size_t) l.il];
+            WinSel ws;
+            if (wpull) {
+                ws.xtab = l.pf_tab;
+                ws.xbuf = pf.xbuf;
+                ws.xstride = pf.dd.stride;
+                ws.n = pf.win_n;
+                ws.sel = pf.wsel;
+                if (pf.wrun.load(std::memory_order_relaxed)) {
+                    ws.hsrc = pf.whsrc;
+                    ws.hseq = pf.whseq;
+                }
+                ++pf.win_pulls;
+            }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], rpf);
+                          na[1], rpf, wpull ? &ws : nullptr);
+            const bool wce = wpull && pf.wrun.load(std::memory_order_relaxed);
+            if (wpull && !wce) {   // (the pull kernel beside the shared expert, on a stream of its own)
+                CK(cudaEventRecord(pf.evX[0], s));
+                CK(cudaStreamWaitEvent(pf.sX, pf.evX[0], 0));
+                win_pull(pf.wsel, l.pf_tab, pf.xbuf, pf.dd.stride, pf.mats[(size_t) l.il], pf.win_n, pf.xblocks, pf.sX);
+                CK(cudaEventRecord(pf.evX[1], pf.sX));
+            }
             if (xp) {   // (beside the shared expert, on a stream of its own)
                 CK(cudaEventRecord(pf.evX[0], s));
                 CK(cudaStreamWaitEvent(pf.sX, pf.evX[0], 0));
@@ -9812,6 +10032,12 @@ struct Model::Impl {
                 mw.grp_start = d.grp_start;
                 mw.grp_ent = d.grp_ent;
                 mw.n_groups = d.n_groups;
+                const unsigned long long xlo = (unsigned long long) pf.xbuf, xhi = xlo + (unsigned long long) kPicks * pf.dd.stride;
+                if (wpull) {   // the VRAM experts first, the pulled ones once they are in
+                    mw.only = 1;
+                    mw.lo = xlo;
+                    mw.hi = xhi;
+                }
                 gf::moe_win_group(mw, s);
                 x3::WinArgs wa;
                 wa.grp_ptr = d.grp_ptr;
@@ -9838,9 +10064,38 @@ struct Model::Impl {
                 wa.n_embd = D;
                 wa.n_ff = FF;
                 wa.limit = g.lim;
-                if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
-                    err = "exl3 win_experts failed";
-                    return false;
+                if (wpull && lay.fmt == gg::kFmtMXFP4) {
+                    wa.phase = 1;
+                    if (!gg::win_experts(wa, s)) {
+                        err = "win_experts (VRAM experts) failed";
+                        return false;
+                    }
+                    gf::MoeWin mw2 = mw;
+                    mw2.grp_ptr = d.grp2_ptr;
+                    mw2.grp_start = d.grp2_start;
+                    mw2.grp_ent = d.grp2_ent;
+                    mw2.n_groups = d.n_groups2;
+                    mw2.only = 2;
+                    gf::moe_win_group(mw2, s);
+                    if (wce) wait_seq(pf.wdone, sq, s);
+                    else CK(cudaStreamWaitEvent(s, pf.evX[1], 0));
+                    x3::WinArgs wb = wa;
+                    wb.grp_ptr = d.grp2_ptr;
+                    wb.grp_start = d.grp2_start;
+                    wb.grp_ent = d.grp2_ent;
+                    wb.n_groups = d.n_groups2;
+                    wb.phase = 2;
+                    if (!gg::win_experts(wb, s)) {
+                        err = "win_experts (pulled experts) failed";
+                        return false;
+                    }
+                } else {
+                    if (wce) wait_seq(pf.wdone, sq, s);
+                    else if (wpull) CK(cudaStreamWaitEvent(s, pf.evX[1], 0));
+                    if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
+                        err = "exl3 win_experts failed";
+                        return false;
+                    }
                 }
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;

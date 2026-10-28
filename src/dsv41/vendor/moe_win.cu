@@ -24,6 +24,8 @@ __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
             gof[e] = -1;
             const unsigned long long p = i < w.k ? w.plan_ptr[e] : 0ull;
             if (p == 0ull) continue;
+            const bool in = p >= w.lo && p < w.hi;
+            if ((w.only == 1 && in) || (w.only == 2 && !in)) continue;
             int g = 0;
             while (g < ng && gp[g] != p) ++g;
             if (g == ng) {
