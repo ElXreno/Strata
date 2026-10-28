@@ -674,6 +674,7 @@ struct Layer {
     int n_slots = 0, spare_vram = -1;
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
+    std::vector<float> ema, ema_new;            // DS4_CACHE_EMA: picks a token, averaged; this window's picks
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
     bool swap_pending = false;
     unsigned long long* tab_pin = nullptr;      // pinned: the table entries a swap writes
@@ -1059,6 +1060,8 @@ struct Model::Impl {
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
+    // DS4_CACHE_EMA=a: VRAM swaps by an average of picks a token, decayed x a a token
+    const float c_ema = env_f("DS4_CACHE_EMA", 0.0f), c_ema_margin = env_f("DS4_CACHE_EMA_MARGIN", 1.0f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
     // the RAM tier (a GGUF's in-place experts, as GLM's: the hottest in VRAM, the next hottest here, the coldest in the
     // files): RAM slots of one expert blob each, filled at load with the hottest experts VRAM does not hold, so the
@@ -4079,6 +4082,11 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e) sum += p[e];
                 const double sc = sum > 0 ? 512.0 / sum : 0.0;
                 for (int e = 0; e < l.n_exp; ++e) l.heat[(size_t) e] = (float) (p[e] * sc);
+                if (c_ema > 0.0f) {
+                    l.ema.assign((size_t) l.n_exp, 0.0f);
+                    l.ema_new.assign((size_t) l.n_exp, 0.0f);
+                    for (int e = 0; e < l.n_exp; ++e) l.ema[(size_t) e] = sum > 0 ? (float) (l.k_exp * p[e] / sum) : 0.0f;
+                }
             }
             const int n_host = l.n_exp - l.n_vram;
             {   // the CPU lane's parts of an expert (in place: the whole expert, its pieces where the file has them)
@@ -5881,6 +5889,45 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
+        static const bool flow = std::getenv("DS4_LANE_FLOW") != nullptr && std::atoi(std::getenv("DS4_LANE_FLOW")) != 0;
+        if (flow && NH == 1) {   // no barrier: an entry's down rows open once its gate/up rows are done
+            struct alignas(64) Left { std::atomic<int> v{0}; };
+            std::vector<Left> left((size_t) ne);
+            for (int x = 0; x < ne; ++x) left[(size_t) x].v.store(GB, std::memory_order_relaxed);
+            const int ngu = ne * GB;
+            std::function<void(int)> g[1];
+            g[0] = [&](int j) {
+                if (j < ngu) {
+                    f[0](j);
+                    const int x = j / GB;
+                    if (left[(size_t) x].v.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+                    const Ent& en = ents[(size_t) (ord != nullptr ? ord[x] : x)];
+                    for (int i = 0; i < en.n; ++i)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                    left[(size_t) x].v.store(-1, std::memory_order_release);
+                    return;
+                }
+                const int jd = j - ngu, x = jd / DB;
+                while (left[(size_t) x].v.load(std::memory_order_acquire) != -1) cpu_relax();
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[x] : x)];
+                const int r0 = (jd % DB) * RBD, r1 = std::min(Eh, r0 + RBD);
+                const void* hp[kEntMax];
+                float* yp[kEntMax];
+                for (int i = 0; i < en.n; ++i) {
+                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E;
+                }
+                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, 0), hp, en.n, yp, r0, r1);
+            };
+            run_nodes(ngu + ne * DB, g);
+            static double acc[3] = {};
+            acc[0] += now_ms() - tp1; acc[1] += 1; acc[2] += ne;
+            if (std::getenv("DS4_PROF") != nullptr && ((long long) acc[1]) % 1000 == 0)
+                std::fprintf(stderr, "ds4 prof CPU lane (flow) per call: n %.0f, entries/call %.2f, %.3f ms\n", acc[1],
+                             acc[2] / acc[1], acc[0] / acc[1]);
+            return;
+        }
         run_nodes(ne * GB, f);
         const double tp2 = now_ms();
         for (const Ent& en : ents)
@@ -6436,13 +6483,18 @@ struct Model::Impl {
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
             int best = -1, vin = -1;
+            const bool by_ema = !l.ema.empty();
+            const std::vector<float>& hs = by_ema ? l.ema : l.heat;
             for (int e : hits)
-                if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+                if (l.slot[(size_t) e] < 0 && (best < 0 || hs[(size_t) e] > hs[(size_t) best])) best = e;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] >= 0 && (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
-                if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
+                    if (l.slot[(size_t) e] >= 0 && !(by_ema && l.ema_new[(size_t) e] > 0.0f) &&
+                        (cold < 0 || hs[(size_t) e] < hs[(size_t) cold]))
+                        cold = e;
+                if (cold >= 0 && (by_ema ? hs[(size_t) best] >= hs[(size_t) cold] * c_ema_margin
+                                         : hs[(size_t) best] > hs[(size_t) cold] * c_margin + c_bonus)) {
                     l.swap_pending = true;
                     ++sw_inflight;
                     vin = best;
@@ -6475,6 +6527,14 @@ struct Model::Impl {
             std::lock_guard<std::mutex> lk(sw_mu);
             ram_queue.push_back(rs);
             rqueued = true;
+        }
+        if (c_ema > 0.0f) {   // (the decisions above saw the history before this window)
+            const float dk = std::pow(c_ema, (float) T);
+            for (Layer& l : L)
+                for (size_t e = 0; e < l.ema.size(); ++e) {
+                    l.ema[e] = dk * l.ema[e] + (1.0f - c_ema) * l.ema_new[e];
+                    l.ema_new[e] = 0.0f;
+                }
         }
         if (queued) sw_cv.notify_all();
         if (rqueued) ram_cv.notify_one();
@@ -7035,6 +7095,7 @@ struct Model::Impl {
                         if (e < 0 || e >= l.n_exp) continue;
                         ++pr[e];
                         l.heat[(size_t) e] += 1.0f;
+                        if (!l.ema_new.empty()) l.ema_new[(size_t) e] += 1.0f;
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -7958,6 +8019,7 @@ struct Model::Impl {
                 pr[e] += (uint32_t) cnt;
                 if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
                     l.heat[(size_t) e] += (float) cnt;
+                    if (!l.ema_new.empty()) l.ema_new[(size_t) e] += (float) cnt;
                     if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
                 }
             }
@@ -9831,6 +9893,7 @@ struct Model::Impl {
                 }
                 ++pr[e];
                 l.heat[(size_t) e] += 1.0f;
+                if (!l.ema_new.empty()) l.ema_new[(size_t) e] += 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
                 per[(size_t) e].push_back({t, i});
             }
