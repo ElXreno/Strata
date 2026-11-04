@@ -123,7 +123,8 @@ public:
     /// --lookup-max-t: capture the T-token window graph now instead of on first use.  false with `no_vram` set: the
     /// graph found no VRAM - nothing else changed, and a smaller window can run instead.  A layer split's stages
     /// keep the capture on first use (true, nothing done).
-    bool prepare(int T, bool& no_vram, std::string& err);
+    /// `pos0`: where the window will start, for the variant run() picks there (STRATA_SELECT_LONG).
+    bool prepare(int T, int64_t pos0, bool& no_vram, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }

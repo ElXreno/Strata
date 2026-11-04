@@ -14389,10 +14389,10 @@ int main(int argc, char** argv) {
         // --lookup-max-t: a lookup window's graph is captured before its round; a size whose graph finds no VRAM is
         // dropped for good (the policy never picks it again) and the round takes the next smaller allowed size.
         // -1: a capture failed for another reason (err says why).
-        auto graph_fits = [&](int t) -> int {
+        auto graph_fits = [&](int t, int64_t pos0) -> int {
             while (t > 1) {
                 bool no_vram = false;
-                if (ver.prepare(t, no_vram, err)) return t;
+                if (ver.prepare(t, pos0, no_vram, err)) return t;
                 if (!no_vram) return -1;
                 policy.disable(t);
                 std::fprintf(stderr, "strata serve: no VRAM for the %d-token window graph: that size is dropped, "
@@ -17559,7 +17559,7 @@ int main(int argc, char** argv) {
                     // --lookup-max-t: the prompt's windows take the allowed sizes too (each size is a graph of its own);
                     // one whose graph finds no VRAM is dropped as in decode
                     if (o.lookup_max_t > 0) {
-                        T = graph_fits(policy.fit(T));
+                        T = graph_fits(policy.fit(T), q);
                         if (T < 0) { e = err; return false; }
                     }
                     for (int t = 0; t < T; ++t) {
@@ -19578,7 +19578,7 @@ int main(int argc, char** argv) {
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                             if (pk.lookup && !trace_nopick) { T = pk.t; from_sfx = true; }
                             if (pk.lookup && !trace_nopick && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
-                                const int t = graph_fits(T);
+                                const int t = graph_fits(T, p);
                                 if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                                 T = t;
                             }
@@ -19589,7 +19589,7 @@ int main(int argc, char** argv) {
                     sfx.propose(S_look - 1, sbuf.data());
                     T = dfr_T; from_sfx = true; sfx_match = dfr_match;
                     if (o.lookup_max_t > 0) {
-                        const int t = graph_fits(T);
+                        const int t = graph_fits(T, p);
                         if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         T = t;
                     }
@@ -19611,7 +19611,7 @@ int main(int argc, char** argv) {
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                     if (chain_n > 0 && o.lookup_max_t > 0) {
-                        const int t = graph_fits(T + chain_n);
+                        const int t = graph_fits(T + chain_n, p);
                         if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         chain_n = std::max(0, t - T);
                     }
