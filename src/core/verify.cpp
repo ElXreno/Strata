@@ -4387,8 +4387,8 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
 bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     evicted = false;
     if (no_window_eviction_ || keep_t < 1) return true;
-    bool have[strata::kernels::kWindowMaxT + 1] = {};
-    const int top = std::min<int>(max_t_, strata::kernels::kWindowMaxT);
+    bool have[strata::kernels::kVerifyLongT + 1] = {};
+    const int top = std::min<int>(max_t_, strata::kernels::kVerifyLongT);
     for (int t = 1; t <= top; ++t) have[t] = (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t]) != nullptr;
     const int victim = strata::core::pick_window_victim(have, top, keep_t, prelaunched_);
     if (victim == 0) return true;
@@ -4547,10 +4547,11 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     return true;
 }
 
-bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
+bool Verifier::prepare(int T, int64_t pos0, bool& no_vram, std::string& err) {
     no_vram = false;
 #if defined(STRATA_GPU_METAL)
     (void) T;
+    (void) pos0;
     (void) err;
     return true;
 #else
@@ -4558,6 +4559,7 @@ bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
     if (next_ != nullptr || lb_ > 0) return true;
     const OnDevice on_device(device_);
     refresh_ar();
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // (as run() will at pos0)
     if ((ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]) != nullptr) return true;
     capture_oom_ = false;
     if (capture(T, err)) return true;
