@@ -41,6 +41,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/lookahead_select.hpp"
 #include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
@@ -698,6 +699,47 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 
+bool Verifier::set_gpu_lookahead(const std::string& path, float tau, int max_out, std::string& err) {
+    const ModelGeometry& g = *g_;
+    const int64_t NE = g.n_expert, N = g.n_embd, L = g.n_layers;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    uint32_t head[4] = {0, 0, 0, 0};
+    if (f == nullptr || std::fread(head, sizeof head, 1, f) != 1 || head[0] != 0x31574b4cu || head[1] != (uint32_t) L ||
+        head[2] != (uint32_t) NE || head[3] != (uint32_t) N) {
+        if (f != nullptr) std::fclose(f);
+        err = "verify: " + path + " is not a look-ahead predictor for this model";
+        return false;
+    }
+    std::vector<uint16_t> w((size_t) (L * NE * N));
+    std::vector<float> b((size_t) (L * NE));
+    bool ok = true;
+    for (int64_t l = 0; l < L && ok; ++l)
+        ok = std::fread(w.data() + (size_t) (l * NE * N), 2, (size_t) (NE * N), f) == (size_t) (NE * N) &&
+             std::fread(b.data() + (size_t) (l * NE), 4, (size_t) NE, f) == (size_t) NE;
+    std::fclose(f);
+    if (!ok) { err = "verify: " + path + " is short"; return false; }
+    pred_max_ = max_out < 1 ? 1 : max_out > 64 ? 64 : max_out;
+    pred_tau_ = tau;
+    const size_t out_bytes = (size_t) L * (size_t) (1 + pred_max_) * sizeof(int32_t);
+    if (cudaMalloc(&pred_w_, w.size() * 2) != cudaSuccess || cudaMalloc(&pred_b_, b.size() * 4) != cudaSuccess ||
+        cudaMalloc(&pred_logits_, (size_t) max_t_ * (size_t) NE * sizeof(float)) != cudaSuccess ||
+        cudaHostAlloc(&pred_host_, out_bytes, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &pred_dev_, pred_host_, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "verify: the GPU look-ahead does not fit (" + std::to_string((w.size() * 2) >> 20) + " MiB of weights)";
+        return false;
+    }
+    std::memset(pred_host_, 0, out_bytes);
+    if (cudaMemcpy(pred_w_, w.data(), w.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pred_b_, b.data(), b.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "verify: the GPU look-ahead upload failed";
+        return false;
+    }
+    std::fprintf(stderr, "strata verify: GPU look-ahead %s: up to %d next-layer experts above p %.3f, %zu MiB of VRAM\n",
+                 path.c_str(), pred_max_, (double) pred_tau_, (w.size() * 2 + b.size() * 4) >> 20);
+    return true;
+}
+
 Verifier::~Verifier() {
 #if defined(STRATA_GPU_METAL)
     strata::metal_engine::window_destroy(metal_);
@@ -740,6 +782,10 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     for (float* b : slot_bias_dev_) if (b) cudaFree(b);
     if (slot_hist_d_) cudaFree(slot_hist_d_);
+    if (pred_w_) cudaFree(pred_w_);
+    if (pred_b_) cudaFree(pred_b_);
+    if (pred_logits_) cudaFree(pred_logits_);
+    if (pred_host_) cudaFreeHost(pred_host_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -2241,6 +2287,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
+        if (pred_w_ != nullptr && l + 1 < g.n_layers && NE == 512) {
+            try {
+                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, pred_w_ + (size_t) (l + 1) * (size_t) NE * (size_t) N,
+                                          pred_logits_ + tb * NE, NE, N, NE, n, cs);
+            } catch (const std::exception& e) { err = "verify look-ahead: " + std::string(e.what()); return false; }
+            strata::kernels::lookahead_select(pred_logits_ + tb * NE, n, pred_b_ + (size_t) (l + 1) * (size_t) NE,
+                                              hits_.d_res != nullptr ? hits_.d_res + (l + 1) * g.n_expert : nullptr, pred_tau_,
+                                              pred_max_, pred_dev_ + (size_t) l * (size_t) (1 + pred_max_), cs);
+        }
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,

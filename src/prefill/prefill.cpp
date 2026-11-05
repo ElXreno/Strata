@@ -102,7 +102,49 @@ public:
         return d;
     }
 
+    static bool hc_on() {
+        static const bool on = [] { const char* e = std::getenv("STRATA_FEAT_DUMP_HC"); return e != nullptr && e[0] == '1'; }();
+        return on;
+    }
+
+    void push_tokens(int32_t pos, const int64_t* tokens, int64_t t) {
+        Slot& s = slots_[next_];
+        next_ = (next_ + 1) % slots_.size();
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&] { return !s.busy; });
+        }
+        const size_t bytes = (size_t) t * 4;
+        if (s.cap < bytes) {
+            if (s.host != nullptr) cudaFreeHost(s.host);
+            s.cap = std::max<size_t>(bytes, (size_t) 8192 * 4);
+            if (cudaHostAlloc(&s.host, s.cap, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                s.host = nullptr;
+                s.cap = 0;
+                return;
+            }
+        }
+        int32_t* h = static_cast<int32_t*>(s.host);
+        for (int64_t i = 0; i < t; ++i) h[i] = (int32_t) tokens[i];
+        cudaEventRecord(s.ev, nullptr);
+        s.hd[0] = 0x54414546;
+        s.hd[1] = 3000;
+        s.hd[2] = pos;
+        s.hd[3] = (int32_t) t;
+        s.hd[4] = 1;
+        s.hd[5] = 1;
+        s.bytes = bytes;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            s.busy = true;
+            q_.push_back(&s);
+        }
+        cv_.notify_all();
+    }
+
     void push(int32_t layer, int32_t pos, int64_t t, int64_t k, int64_t n, const int32_t* ids, const uint16_t* x, cudaStream_t cs) {
+        if (!layers_.empty() && !layers_[(size_t) (layer % 1000) % layers_.size()]) return;
         const int64_t rows = (t + stride_ - 1) / stride_;
         const size_t ids_bytes = (size_t) (rows * k * 4), x_bytes = (size_t) (rows * n * 2);
         Slot& s = slots_[next_];
@@ -152,6 +194,15 @@ private:
     };
 
     FeatDumper(const char* path, int stride) : stride_(stride), slots_(6) {
+        if (const char* e = std::getenv("STRATA_FEAT_LAYERS"); e != nullptr && e[0] != '\0') {
+            layers_.assign(64, false);
+            for (const char* q = e; *q != '\0';) {
+                const int v = std::atoi(q);
+                if (v >= 0 && v < 64) layers_[(size_t) v] = true;
+                while (*q != '\0' && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+        }
         file_ = std::fopen(path, "wb");
         if (file_ == nullptr) return;
         for (Slot& s : slots_) cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
@@ -182,6 +233,7 @@ private:
     }
 
     std::FILE* file_ = nullptr;
+    std::vector<bool> layers_;
     int stride_ = 1;
     std::vector<Slot> slots_;
     size_t next_ = 0;
@@ -3511,6 +3563,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
         }
+        if (FeatDumper* fd = FeatDumper::get()) {
+            static int64_t tpos = 0;
+            fd->push_tokens((int32_t) tpos, tokens + c0, T);
+            tpos += T;
+        }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
         bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
@@ -4187,6 +4244,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
                 }
+                if (half == 0)
+                    if (FeatDumper* fd = FeatDumper::get()) {
+                        static int64_t apos[64] = {};
+                        fd->push((int32_t) (1000 + l), (int32_t) apos[l & 63], T, K, N, m.ids, m.mixed_bf, (cudaStream_t) m.cs);
+                        apos[l & 63] += T;
+                    }
+                if (half == 1 && FeatDumper::hc_on())
+                    if (FeatDumper* fd = FeatDumper::get()) {
+                        static int64_t hpos[64] = {};
+                        fd->push((int32_t) (2000 + l), (int32_t) hpos[l & 63], T, K, 2 * D, m.ids, (const uint16_t*) m.R, (cudaStream_t) m.cs);
+                        hpos[l & 63] += T;
+                    }
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
                     core::NativeDense::hc_bf16_release(m.cs, 0, 0);
