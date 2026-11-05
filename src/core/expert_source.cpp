@@ -4917,6 +4917,67 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+struct PredDump {
+    std::FILE* f = nullptr;
+    uint64_t window = 0;
+    std::vector<uint16_t> x;
+    std::vector<int16_t> ids;
+    std::vector<uint8_t> res;
+    std::vector<uint8_t> map;
+    PredDump() {
+        const char* dir = std::getenv("STRATA_PRED_DUMP");
+        if (dir == nullptr || dir[0] == '\0') return;
+        const std::string path = std::string(dir) + "/trace.bin";
+        f = std::fopen(path.c_str(), "ab");
+        if (f != nullptr) std::setvbuf(f, nullptr, _IOFBF, 16u << 20);
+        std::fprintf(stderr, "strata: STRATA_PRED_DUMP: %s %s\n", path.c_str(), f != nullptr ? "open" : "FAILED");
+    }
+    ~PredDump() {
+        if (f != nullptr) std::fclose(f);
+    }
+    static uint16_t bf16(float v) {
+        uint32_t u = 0;
+        std::memcpy(&u, &v, 4);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        return (uint16_t) (u >> 16);
+    }
+    void write(int64_t layer, const float* x_f, int64_t n_tok, const int32_t* routed, int64_t k, const int32_t* host_res,
+               int64_t n_expert) {
+        if (f == nullptr) return;
+        if (layer == 0) {
+            ++window;
+            std::fflush(f);
+        }
+        const int64_t h = strata::kernels::cpu::H;
+        x.resize((size_t) (n_tok * h));
+        for (int64_t i = 0; i < n_tok * h; ++i) x[(size_t) i] = bf16(x_f[i]);
+        ids.resize((size_t) (n_tok * k));
+        res.resize((size_t) (n_tok * k));
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int32_t e = routed[i];
+            ids[(size_t) i] = (int16_t) e;
+            res[(size_t) i] = host_res != nullptr && e >= 0 && e < n_expert && host_res[(size_t) (layer * n_expert + e)] >= 0;
+        }
+        map.assign((size_t) ((n_expert + 7) / 8), 0);
+        if (host_res != nullptr)
+            for (int64_t e = 0; e < n_expert; ++e)
+                if (host_res[(size_t) (layer * n_expert + e)] >= 0) map[(size_t) (e >> 3)] |= (uint8_t) (1u << (e & 7));
+        const uint32_t head[7] = {0x32445250u, (uint32_t) layer, (uint32_t) n_tok, (uint32_t) k, (uint32_t) (window & 0xffffffffu),
+                                  (uint32_t) (window >> 32), (uint32_t) n_expert};
+        std::fwrite(head, sizeof head, 1, f);
+        std::fwrite(x.data(), 2, x.size(), f);
+        std::fwrite(ids.data(), 2, ids.size(), f);
+        std::fwrite(res.data(), 1, res.size(), f);
+        std::fwrite(map.data(), 1, map.size(), f);
+    }
+};
+PredDump& pred_dump() {
+    static PredDump p;
+    return p;
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -4927,6 +4988,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    pred_dump().write(d.layers, x_f, n_tok, ids, k, d.host_res, d.n_expert);
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
