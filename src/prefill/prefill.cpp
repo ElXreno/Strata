@@ -10,6 +10,10 @@
 #include "strata/prefill/share_rules.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
@@ -83,6 +87,109 @@ bool ple_batch_enabled() {
                              "compute capability 12.0 card (issues #220, #224). Use an engine built with CUDA 13.0 or newer; STRATA_PLE_BATCH=1 turns it on anyway.\n");
     return on;
 }
+
+class FeatDumper {
+public:
+    static FeatDumper* get() {
+        static FeatDumper* d = [] {
+            const char* p = std::getenv("STRATA_FEAT_DUMP");
+            if (p == nullptr || p[0] == '\0') return (FeatDumper*) nullptr;
+            const char* s = std::getenv("STRATA_FEAT_DUMP_STRIDE");
+            auto* f = new FeatDumper(p, s != nullptr && std::atoi(s) > 1 ? std::atoi(s) : 1);
+            if (f->file_ == nullptr) { delete f; return (FeatDumper*) nullptr; }
+            return f;
+        }();
+        return d;
+    }
+
+    void push(int32_t layer, int32_t pos, int64_t t, int64_t k, int64_t n, const int32_t* ids, const uint16_t* x, cudaStream_t cs) {
+        const int64_t rows = (t + stride_ - 1) / stride_;
+        const size_t ids_bytes = (size_t) (rows * k * 4), x_bytes = (size_t) (rows * n * 2);
+        Slot& s = slots_[next_];
+        next_ = (next_ + 1) % slots_.size();
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&] { return !s.busy; });
+        }
+        if (s.cap < ids_bytes + x_bytes) {
+            if (s.host != nullptr) cudaFreeHost(s.host);
+            s.cap = std::max<size_t>(ids_bytes + x_bytes, (size_t) 8192 * (size_t) (k * 4 + n * 2) / (size_t) stride_);
+            if (cudaHostAlloc(&s.host, s.cap, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                s.host = nullptr;
+                s.cap = 0;
+                return;
+            }
+        }
+        uint8_t* h = static_cast<uint8_t*>(s.host);
+        cudaMemcpy2DAsync(h, (size_t) k * 4, ids, (size_t) (k * 4 * stride_), (size_t) k * 4, (size_t) rows,
+                          cudaMemcpyDeviceToHost, cs);
+        cudaMemcpy2DAsync(h + ids_bytes, (size_t) n * 2, x, (size_t) (n * 2 * stride_), (size_t) n * 2, (size_t) rows,
+                          cudaMemcpyDeviceToHost, cs);
+        cudaEventRecord(s.ev, cs);
+        s.hd[0] = 0x54414546;
+        s.hd[1] = layer;
+        s.hd[2] = pos;
+        s.hd[3] = (int32_t) rows;
+        s.hd[4] = stride_;
+        s.hd[5] = (int32_t) k;
+        s.bytes = ids_bytes + x_bytes;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            s.busy = true;
+            q_.push_back(&s);
+        }
+        cv_.notify_all();
+    }
+
+private:
+    struct Slot {
+        void* host = nullptr;
+        size_t cap = 0, bytes = 0;
+        cudaEvent_t ev = nullptr;
+        int32_t hd[6] = {};
+        bool busy = false;
+    };
+
+    FeatDumper(const char* path, int stride) : stride_(stride), slots_(6) {
+        file_ = std::fopen(path, "wb");
+        if (file_ == nullptr) return;
+        for (Slot& s : slots_) cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming);
+        writer_ = std::thread([this] { run(); });
+        writer_.detach();
+        std::fprintf(stderr, "strata prefill: STRATA_FEAT_DUMP %s, every %d row(s), written on a thread of its own\n", path, stride);
+    }
+
+    void run() {
+        for (;;) {
+            Slot* s = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return !q_.empty(); });
+                s = q_.front();
+                q_.pop_front();
+            }
+            cudaEventSynchronize(s->ev);
+            std::fwrite(s->hd, sizeof s->hd, 1, file_);
+            std::fwrite(s->host, 1, s->bytes, file_);
+            std::fflush(file_);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                s->busy = false;
+            }
+            cv_.notify_all();
+        }
+    }
+
+    std::FILE* file_ = nullptr;
+    int stride_ = 1;
+    std::vector<Slot> slots_;
+    size_t next_ = 0;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Slot*> q_;
+    std::thread writer_;
+};
 }  // namespace
 #include "strata/core/defaults_026.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -4502,6 +4609,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (FeatDumper* fd = FeatDumper::get()) {
+                        static int64_t fpos[64] = {};
+                        fd->push((int32_t) l, (int32_t) fpos[l & 63], T, K, N, m.ids, m.mixed_bf, (cudaStream_t) m.cs);
+                        fpos[l & 63] += T;
+                    }
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -6490,7 +6602,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         if (core::nibble::layer(l).on) { why = "STRATA_EXPERT_NIBBLE (the experts are 4-bit slots)"; return 0; }
 #endif
     // run_impl's debug hooks on the routing and the rows have no layer-major form
-    if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
+    if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL") ||
+        std::getenv("STRATA_FEAT_DUMP")) {
         why = "a routing or row debug dump";
         return 0;
     }
