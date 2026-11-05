@@ -3731,6 +3731,7 @@ bool FileExpertSource::pin_cache_complement(
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
     bool paced = false;         ///< #1250: the pages are taken in steps and page-locked afterwards
+    bool thp_whole = false;
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
@@ -3833,7 +3834,38 @@ bool FileExpertSource::pin_cache_complement(
                                  "nothing placed\n");
         }
 #endif
-        if (pin && !paced) {
+#if defined(__linux__)
+        if (pin && !paced && bytes > 0) {
+            std::string thp_note;
+            const strata::core::ThpRequest thp = strata::core::thp_request_for(bytes, thp_note);
+            constexpr size_t kHuge = 2u << 20;
+            const size_t len = (size_t) ((bytes + kHuge - 1) / kHuge * kHuge);
+            void* p = nullptr;
+            if (thp != strata::core::ThpRequest::Skip && posix_memalign(&p, kHuge, len) == 0) {
+                if (thp == strata::core::ThpRequest::Madvise) (void) madvise(p, len, MADV_HUGEPAGE);
+                void* alias = nullptr;
+                if (cudaHostRegister(p, (size_t) bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+                    if (cudaHostGetDevicePointer(&alias, p, 0) == cudaSuccess && alias != nullptr) {
+                        arena = p;
+                        device = (const uint8_t*) alias;
+                        partial_pin = bytes;
+                        thp_whole = true;
+                        note = "registered 2 MiB-aligned memory, " + thp_note;
+                    } else {
+                        (void) cudaGetLastError();
+                        (void) cudaHostUnregister(p);
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                }
+                if (arena == nullptr) std::free(p);
+            }
+            if (arena == nullptr && thp != strata::core::ThpRequest::Skip)
+                std::fprintf(stderr, "FileExpertSource: the huge-page resident copy was refused (%s); page-locked by the driver\n",
+                             thp_note.c_str());
+        }
+#endif
+        if (pin && !paced && arena == nullptr) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -4173,7 +4205,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_registered_ = !pinned_ok && partial_pin > 0;
     // a paced registration that covers the whole arena is as good as a cudaHostAlloc'd one
-    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
+    complement_partial_ = complement_registered_ && !((paced || thp_whole) && partial_pin >= bytes);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region

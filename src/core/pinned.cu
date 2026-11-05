@@ -567,6 +567,45 @@ void set_held_address_space(std::vector<uint64_t> bases) {
     g_held = std::move(bases);
 }
 
+ThpRequest thp_request_for(uint64_t bytes, std::string& note) {
+#ifdef _WIN32
+    (void) bytes;
+    note = "no transparent huge pages on Windows";
+    return ThpRequest::Skip;
+#else
+    if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr || std::getenv("STRATA_NO_ARENA_THP") != nullptr) {
+        note = "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+        return ThpRequest::Skip;
+    }
+    std::string mode;
+    if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
+        char line[128] = {0};
+        if (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* open = std::strchr(line, '[');
+            const char* close = open ? std::strchr(open, ']') : nullptr;
+            if (open && close) mode.assign(open + 1, close);
+        }
+        std::fclose(f);
+    }
+    if (mode == "always") {
+        note = "transparent huge pages are on for every mapping (THP always)";
+        return ThpRequest::Always;
+    }
+    if (mode != "madvise") {
+        note = "transparent huge pages are off (THP " + (mode.empty() ? std::string("?") : mode) + ")";
+        return ThpRequest::Skip;
+    }
+    const uint64_t free_huge = free_huge_bytes();
+    if (std::getenv("STRATA_ARENA_THP") == nullptr && free_huge < bytes / 2) {
+        note = "transparent huge pages NOT requested: only " + std::to_string(free_huge >> 30) + " GiB of free 2 MiB blocks for " +
+               std::to_string(bytes >> 30) + " GiB (STRATA_ARENA_THP=1 requests them anyway) (#2126)";
+        return ThpRequest::Skip;
+    }
+    note = "transparent huge pages requested (MADV_HUGEPAGE)";
+    return ThpRequest::Madvise;
+#endif
+}
+
 bool arena_no_register() {
     const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
     if (e != nullptr && *e != '\0') return std::string(e) == "none";   // an explicit setting wins over the engine's flag
