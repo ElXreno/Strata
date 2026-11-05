@@ -81,6 +81,9 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
@@ -175,6 +178,9 @@ struct ConversationStreamView {
 bool conversation_snapshot_stream(SessionSaveSources& save, const ConversationStreamView& view,
                                   const SessionState& session, const ModelGeometry& g, const QsaState& draft,
                                   std::string& error);
+bool conversation_snapshot_stream(SessionSaveSources& save, const ConversationStreamView& view,
+                                  const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                  std::string& error);
 // the live running state of a SessionStreamLayout restore, applied after the K/V targets finished
 struct ConversationStateTarget {
     SessionState* session = nullptr;
@@ -191,6 +197,9 @@ bool conversation_state_target(const SavedConversation& image, const std::array<
 bool conversation_snapshot_validate_stream(const SavedConversation& image, const std::array<uint64_t, 5>& live_state,
                                            const SessionState& session, const ModelGeometry& g,
                                            const QsaState& draft, std::string& error);
+bool conversation_snapshot_validate_stream(const SavedConversation& image, const std::array<uint64_t, 5>& live_state,
+                                           const SessionState& session, const ModelGeometry& g,
+                                           const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
