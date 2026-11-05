@@ -356,6 +356,9 @@ private:
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
+    std::vector<std::vector<float>> bias_;
+    int budget_ = 0;
+    float tau_ = 0.0f;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
     // STRATA_LOOKAHEAD_STATS
