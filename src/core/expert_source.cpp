@@ -5028,6 +5028,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     pred_dump().write(d.layers, x_f, n_tok, ids, k, d.host_res, d.n_expert);
+    if (d.gpu_pred != nullptr && d.fs != nullptr) {
+        const volatile int32_t* p = d.gpu_pred + (size_t) d.layers * (size_t) d.gpu_pred_stride;
+        const int c = p[0];
+        for (int i = 0; i < c && i + 1 < d.gpu_pred_stride; ++i) d.fs->predict(d.src, d.layers + 1, p[1 + i]);
+        d.gpu_pred_issued += c;
+    }
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
