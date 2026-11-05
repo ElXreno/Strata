@@ -29,6 +29,9 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+enum class ThpRequest { Skip, Always, Madvise };
+ThpRequest thp_request_for(uint64_t bytes, std::string& note);
+
 /// 153-igpu, UMA mode: the engine sets this on an integrated GPU whose firmware cannot survive a KFD queue eviction (the Radeon
 /// 780M, gfx1103).  The expert arena is then NOT registered with the GPU driver: a registered range is a userptr that the
 /// kernel's page migration (compaction, reclaim) invalidates, and every invalidation evicts the process's GPU queues (MES
