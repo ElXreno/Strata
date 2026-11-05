@@ -5629,6 +5629,54 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
     }
 
+    struct LaneBusy {
+        std::atomic<int64_t> sum{0}, first{INT64_MAX}, last{0}, jmax{0};
+        static int64_t ns() {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+        void reset() { sum = 0; first = INT64_MAX; last = 0; jmax = 0; }
+        void add(int64_t a, int64_t b) {
+            sum += b - a;
+            int64_t v = first.load();
+            while (a < v && !first.compare_exchange_weak(v, a)) {}
+            v = last.load();
+            while (b > v && !last.compare_exchange_weak(v, b)) {}
+            v = jmax.load();
+            while (b - a > v && !jmax.compare_exchange_weak(v, b - a)) {}
+        }
+    };
+    void run_nodes_busy(int n, const std::function<void(int)>* f, int ph) {
+        static const bool on = std::getenv("DS4_LANE_BUSY") != nullptr;
+        if (!on) return run_nodes(n, f);
+        static LaneBusy lb;
+        static double acc[2][7] = {};
+        static long calls = 0;
+        lb.reset();
+        std::function<void(int)> g[4];
+        for (int X = 0; X < NH; ++X)
+            g[X] = [&, X](int j) {
+                const int64_t a = LaneBusy::ns();
+                f[X](j);
+                lb.add(a, LaneBusy::ns());
+            };
+        const int64_t t0 = LaneBusy::ns();
+        run_nodes(n, g);
+        const int64_t t1 = LaneBusy::ns();
+        int thr = 0;
+        for (int X = 0; X < NH; ++X) thr += pools[(size_t) X]->size();
+        double* a = acc[ph];
+        a[0] += (t1 - t0) / 1e3; a[1] += lb.sum / 1e3; a[2] += thr; a[3] += (lb.first - t0) / 1e3;
+        a[4] += (t1 - lb.last) / 1e3; a[5] += lb.jmax / 1e3; a[6] += n;
+        if (ph == 1 && ++calls % 2000 == 0)
+            for (int q = 0; q < 2; ++q) {
+                const double* b = acc[q];
+                std::fprintf(stderr, "ds4 lane busy %s: calls %ld, jobs/call %.1f, wall %.1f us, jobs sum %.1f us on %.0f threads -> busy %.1f%%, "
+                             "first job after %.1f us, end after last job %.1f us, longest job %.1f us\n", q == 0 ? "gate+up" : "down", calls,
+                             b[6] / calls, b[0] / calls, b[1] / calls, b[2] / calls, 100.0 * b[1] / (b[0] * (b[2] / calls)), b[3] / calls,
+                             b[4] / calls, b[5] / calls);
+            }
+    }
+
     // a GGUF's MXFP4 experts on the CPU lane, read from the file's mapping or their copy in RAM (mx_part_ptr): each
     // node its rows of every matrix - the gate / up rows [X n_ff / NH, ..) of each entry (the swiglu into its h row),
     // then (h whole) the down rows [X dim / NH, ..) into yd.  A row's sum is the same whatever the split: the same bits
@@ -5726,7 +5774,7 @@ struct Model::Impl {
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        constexpr int RB = 64;   // rows a job
+        static const int RB = std::getenv("DS4_IQ_RB") ? std::atoi(std::getenv("DS4_IQ_RB")) : 64;
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
@@ -5770,42 +5818,99 @@ struct Model::Impl {
                 }
         }
         const double tp1 = now_ms();
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
-                const void* ap[kEntMax];
-                float* hp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    ap[i] = x_act(en, i);
-                    hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
-                }
-                // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
-                // block size of the type)
-                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
-                                   r0 - X * FFh, r1 - X * FFh, lim);
-            };
-        run_nodes(ne * GB, f);
-        const double tp2 = now_ms();
-        for (const Ent& en : ents)
+        auto gate_up = [&](int X, int j) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+            const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+            const void* ap[kEntMax];
+            float* hp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                ap[i] = x_act(en, i);
+                hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
+            }
+            // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
+            // block size of the type)
+            gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                               r0 - X * FFh, r1 - X * FFh, lim);
+        };
+        auto quant_h = [&](const Ent& en) {
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
-        const double tp3 = now_ms();
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[kEntMax];
-                float* yp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
-                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
+        };
+        auto down = [&](int X, int j) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+            const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+            const void* hp[kEntMax];
+            float* yp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
+            }
+            gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+        };
+        static const bool flow = [] {
+            const char* v = std::getenv("DS4_CPU_FLOW");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        std::function<void(int)> f[4];
+        double tp2 = 0, tp3 = 0;
+        if (flow) {
+            std::unique_ptr<std::atomic<int>[]> left(new std::atomic<int>[(size_t) ne]);
+            std::unique_ptr<std::atomic<int>[]> ready(new std::atomic<int>[(size_t) ne]);
+            for (int e = 0; e < ne; ++e) {
+                left[(size_t) e].store(NH * GB, std::memory_order_relaxed);
+                ready[(size_t) e].store(0, std::memory_order_relaxed);
+            }
+            const int ngu = ne * GB;
+            for (int X = 0; X < NH; ++X)
+                f[X] = [&, X](int j) {
+                    if (j < ngu) {
+                        gate_up(X, j);
+                        const int e = ord != nullptr ? ord[j / GB] : j / GB;
+                        if (left[(size_t) e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            quant_h(ents[(size_t) e]);
+                            ready[(size_t) e].store(1, std::memory_order_release);
+                        }
+                        return;
+                    }
+                    const int k = j - ngu;
+                    const int e = ord != nullptr ? ord[k / DB] : k / DB;
+                    while (ready[(size_t) e].load(std::memory_order_acquire) == 0) cpu_relax();
+                    down(X, k);
+                };
+            run_nodes_busy(ne * (GB + DB), f, 1);
+            tp2 = tp3 = now_ms();
+            static const bool check = std::getenv("DS4_CPU_FLOW_CHECK") != nullptr;
+            if (check) {
+                static std::atomic<long> calls{0}, bad{0};
+                std::vector<float> got;
+                for (const Ent& en : ents)
+                    got.insert(got.end(), c_yd.data() + (size_t) en.slot0 * E, c_yd.data() + (size_t) (en.slot0 + en.n) * E);
+                for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gate_up(X, j); };
+                run_nodes(ne * GB, f);
+                for (const Ent& en : ents) quant_h(en);
+                for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { down(X, j); };
+                run_nodes(ne * DB, f);
+                size_t o = 0;
+                bool same = true;
+                for (const Ent& en : ents) {
+                    const size_t len = (size_t) en.n * E;
+                    same = same && std::memcmp(got.data() + o, c_yd.data() + (size_t) en.slot0 * E, len * sizeof(float)) == 0;
+                    o += len;
                 }
-                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
-            };
-        run_nodes(ne * DB, f);
+                if (!same) ++bad;
+                if (++calls % 1000 == 0)
+                    std::fprintf(stderr, "ds4: DS4_CPU_FLOW_CHECK %ld calls, %ld differ\n", calls.load(), bad.load());
+            }
+        } else {
+            for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gate_up(X, j); };
+            run_nodes_busy(ne * GB, f, 0);
+            tp2 = now_ms();
+            for (const Ent& en : ents) quant_h(en);
+            tp3 = now_ms();
+            for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { down(X, j); };
+            run_nodes_busy(ne * DB, f, 1);
+        }
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
             if (on) {
