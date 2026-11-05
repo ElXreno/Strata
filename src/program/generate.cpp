@@ -96,6 +96,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/disk_cache_rules.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/gpu_report.hpp"
@@ -11573,12 +11574,11 @@ int main(int argc, char** argv) {
         // conversation and a hand-saved session file are interchangeable.
         strata::core::ConversationSpillCache conversation_spill;
         strata::core::SessionFileIdentity spill_identity;
-        // --conversation-cache-disk-only opens the disk tier without a RAM cache (single GPU, no --batch / peer)
-        const bool disk_only = o.serve && o.conversation_cache_disk_only && stages.empty() && !multi_gpu &&
-                               o.batch <= 0 && o.peer_device < 1;
+        const bool disk_only = strata::program::disk_cache::disk_only_on(
+            {o.serve, o.conversation_cache_disk_only, stages.empty(), multi_gpu, (int64_t) o.batch, o.peer_device});
         if (o.serve && o.conversation_cache_disk_only && !disk_only)
             std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-disk-only is single-GPU without "
-                                 "--batch or --peer-device; it is off\n");
+                                 "--peer-device; it is off\n");
         if (o.serve && (conversations.enabled() || disk_only) && !o.conversation_cache_spill_dir.empty() &&
             o.conversation_cache_disk_mib > 0 && stages.empty()) {
             std::string identity_error;
@@ -11685,19 +11685,30 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: prefix save skipped (allocation failed)\n");
             }
         };
-        auto disk_save_live = [&](bool durable, const char* why) {
-            if (!disk_only || !conversation_spill.enabled() || !live_ok || live.empty()) return;
+        struct DiskSaveSource {
+            const std::vector<int32_t>& ids;
+            const std::vector<ImgKey>& imgs;
+            const std::vector<ConvCheckpoint>& checks;
+            bool cvec;
+            const strata::core::SessionState& session;
+            const strata::core::QsaState& draft;
+            bool root;
+            std::string what;
+        };
+        auto disk_save = [&](const DiskSaveSource& src, bool durable, const char* why) -> bool {
+            if (!disk_only || !conversation_spill.enabled() || src.ids.empty()) return false;
             const auto t0 = Clock::now();
             try {
                 std::string e;
                 if (!ver.wait_commit(e)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", e.c_str());
-                    return;
+                    std::fprintf(stderr, "strata serve: conversation cache: disk save%s skipped (%s)\n", src.what.c_str(),
+                                 e.c_str());
+                    return false;
                 }
                 strata::core::SessionSaveLive sl;
-                sl.tokens = live.size();
-                sl.images = live_imgs.size();
-                sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                sl.tokens = src.ids.size();
+                sl.images = src.imgs.size();
+                sl.kv_layers = (uint64_t) std::max<int64_t>(src.session.qsa_alloc, 0) + 1;
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 auto admit = [&](uint64_t need, std::string& w) {
                     if (strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need, floor))
@@ -11708,32 +11719,41 @@ int main(int argc, char** argv) {
                 std::vector<const ConvCheckpoint*> disk_checks;
                 std::string w;
                 strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last copy has landed
-                if (!strata::core::session_save_stream_checkpoints(checks, sl, admit, disk_checks, w)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", w.c_str());
-                    return;
+                if (!strata::core::session_save_stream_checkpoints(src.checks, sl, admit, disk_checks, w)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: disk save%s skipped (%s)\n", src.what.c_str(),
+                                 w.c_str());
+                    return false;
                 }
-                const strata::core::ConversationStreamView view{live, live_imgs, disk_checks, cvec_cached};
+                const strata::core::ConversationStreamView view{src.ids, src.imgs, disk_checks, src.cvec};
                 strata::core::SessionSaveSources save;
-                if (!strata::core::conversation_snapshot_stream(save, view, ss, g, mtp.kv_state(), e)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", e.c_str());
-                    return;
+                if (!strata::core::conversation_snapshot_stream(save, view, src.session, g, src.draft, e)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: disk save%s skipped (%s)\n", src.what.c_str(),
+                                 e.c_str());
+                    return false;
                 }
                 size_t bytes = 0;
                 if (!conversation_spill.spill_streamed(save, bytes, e, durable)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: disk save failed (%s); it will be read "
-                                         "again when it returns\n", e.c_str());
-                    return;
+                    std::fprintf(stderr, "strata serve: conversation cache: disk save%s failed (%s); it will be read "
+                                         "again when it returns\n", src.what.c_str(), e.c_str());
+                    return false;
                 }
                 const std::string kept = conversation_spill.newest_path();
-                const size_t dropped = conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached, kept);
-                disk_save_root();
-                std::fprintf(stderr, "strata serve: conversation cache: disk-saved %zu tokens (%zu MiB, %s) in %.1f ms; "
-                             "%zu older cop%s dropped; disk=%zu MiB in %zu files\n", live.size(), bytes >> 20, why,
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), dropped,
+                const size_t dropped = conversation_spill.drop_superseded(src.ids, src.imgs, src.checks, src.cvec, kept);
+                if (src.root) disk_save_root();
+                std::fprintf(stderr, "strata serve: conversation cache: disk-saved %zu tokens%s (%zu MiB, %s) in %.1f ms; "
+                             "%zu older cop%s dropped; disk=%zu MiB in %zu files\n", src.ids.size(), src.what.c_str(),
+                             bytes >> 20, why, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), dropped,
                              dropped == 1 ? "y" : "ies", (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
+                return true;
             } catch (const std::bad_alloc&) {
-                std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (allocation failed)\n");
+                std::fprintf(stderr, "strata serve: conversation cache: disk save%s skipped (allocation failed)\n",
+                             src.what.c_str());
             }
+            return false;
+        };
+        auto disk_save_live = [&](bool durable, const char* why) {
+            if (!live_ok) return;
+            disk_save({live, live_imgs, checks, cvec_cached, ss, mtp.kv_state(), true, ""}, durable, why);
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -14038,14 +14058,57 @@ int main(int argc, char** argv) {
         // Parking is an optimization like a checkpoint (#3350): a skip and a failed snapshot (a host or device
         // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
         // or the engine.
+        auto slot_in_main = [&](const BSlot& sl) {
+            return live_ok && cvec_cached == sl.cvec && live.size() >= sl.ids.size() &&
+                   std::equal(sl.ids.begin(), sl.ids.end(), live.begin()) &&
+                   imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
+        };
+        auto disk_save_slot = [&](int b, bool durable, const char* why) {
+            BSlot& sl = bs[(size_t) b];
+            namespace dc = strata::program::disk_cache;
+            dc::SlotSaveInput in;
+            in.active = sl.active;
+            in.cached = sl.cached;
+            in.partial = sl.partial;
+            in.pictures = sl.img;
+            in.tokens = sl.ids.size();
+            in.wanted = conversations.wants((int64_t) sl.ids.size());
+            in.in_main = !sl.ids.empty() && slot_in_main(sl);
+            if (!sl.ids.empty()) {
+                std::vector<int32_t> probe(sl.ids);
+                probe.push_back(-1);
+                in.on_disk = conversation_spill.best(probe, {}, sl.cvec, o.conversation_cache_similarity,
+                                                     o.conversation_cache_n_min).tokens >= (int64_t) sl.ids.size();
+            }
+            in.use_mtp = use_mtp;
+            in.batch_mtp = batch_mtp;
+            in.batch_df2 = batch_df2;
+            const dc::SlotSave verdict = dc::slot_disk_save(in);
+            if (verdict != dc::SlotSave::save) {
+                if (verdict != dc::SlotSave::not_idle)
+                    std::fprintf(stderr, "strata serve: conversation cache: slot %d not disk-saved (%zu tokens: %s)\n", b,
+                                 sl.ids.size(), dc::slot_disk_save_why(verdict));
+                return;
+            }
+            std::string why_not;
+            if (cudaDeviceSynchronize() != cudaSuccess || (batch_mtp && !slot_mtp[(size_t) b]->idle(why_not))) {
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not disk-saved (%s)\n", b,
+                             why_not.empty() ? "device sync failed" : why_not.c_str());
+                return;
+            }
+            static const std::vector<ImgKey> no_imgs;
+            const strata::core::QsaState& draft = batch_mtp ? slot_mtp[(size_t) b]->kv_state() : mtp.kv_state();
+            disk_save({sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[0][(size_t) b], draft, false,
+                       " from slot " + std::to_string(b)}, durable, why);
+        };
         auto park_slot = [&](int b) {
             BSlot& sl = bs[(size_t) b];
+            if (disk_only) {
+                disk_save_slot(b, false, "slot overwrite");
+                return;
+            }
             if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
-            auto prefix_of = [&](const std::vector<int32_t>& whole) {
-                return whole.size() >= sl.ids.size() && std::equal(sl.ids.begin(), sl.ids.end(), whole.begin());
-            };
-            const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
-                                 imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
+            const bool in_main = slot_in_main(sl);
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
             if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
                 // its park would drop (as superseded) the main session's copy of this conversation, and with it the checkpoints the slot
@@ -16339,6 +16402,8 @@ int main(int argc, char** argv) {
                         cvec_cached = disk_meta.cvec;
                         resume = disk_in_tokens;
                         from_live = disk_in_live;
+                        lent_slot = -1;
+                        moved_in = -1;
                         applied = true;
                     }
                 }
@@ -19769,6 +19834,7 @@ int main(int argc, char** argv) {
         }
         if (conversation_spill.enabled() && disk_only) {   // the live conversation goes to disk, flushed
             if (conversations.wants((int64_t) live.size())) disk_save_live(true, "shutdown");
+            for (int b = 0; b < (int) bs.size(); ++b) disk_save_slot(b, true, "shutdown");
         } else if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
             if (!park_current(0))
                 std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",
