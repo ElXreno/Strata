@@ -227,6 +227,42 @@ void full_session(int fmt, int mode, int experts) {
                                   cudaMemcpyDeviceToHost));
             check(spare==b.live.dead,"stream-all spare pooled row from the saved dead row");
         }
+        {
+            const ConversationStreamView sview{ids,images,{&checkpoints[0]},true};
+            SessionSaveSources save;
+            check(conversation_snapshot_stream(save,sview,ss,g,(const QsaState*) nullptr,err),"no-draft save sources");
+            check(save.kv.size()+1==b.kv.size(),"no-draft save has no draft layer");
+            const std::string p4=(dir/"no-draft.bin").string();
+            size_t n4=0;
+            check(session_file_write(p4,save,id,n4,err),"no-draft file written");
+            fill(203);
+            SavedConversation smeta;
+            SessionStreamLayout layout;
+            check(session_file_read_streamed(p4,id,smeta,n4,err,{},layout),"no-draft read pass");
+            check(smeta.kv.size()+1==b.kv.size(),"no-draft file holds the main layers only");
+            check(!conversation_snapshot_validate_stream(smeta,layout.live_state,ss,g,draft.state,err),
+                  "no-draft file refused where a draft layer is expected");
+            check(conversation_snapshot_validate_stream(smeta,layout.live_state,ss,g,(const QsaState*) nullptr,err),
+                  "no-draft validate");
+            std::vector<ConversationKvTarget> targets;
+            ConversationStateTarget state;
+            check(conversation_kv_targets(smeta,ss,g,(const QsaState*) nullptr,targets,err) &&
+                  conversation_state_target(smeta,layout.live_state,ss,g,state,err),"no-draft targets");
+            cuda_check(cudaDeviceSynchronize());
+            check(session_file_apply_streamed(p4,id,[&](size_t l,size_t part,uint64_t off,const void* d,size_t len){
+                      return l<targets.size() && targets[l].apply(part,off,d,len,err); },layout,err),"no-draft K/V pass");
+            for (auto& t : targets) check(t.finish(err),"no-draft K/V residency");
+            check(session_file_apply_state_streamed(p4,id,[&](size_t part,uint64_t off,const void* d,size_t len){
+                      return state.apply(part,off,d,len,err); },layout,err) && state.finish(smeta.live.ids,err),
+                  "no-draft state pass");
+            SavedConversation back;
+            check(snap_save(back,view,ss,g,draft.state,err),"capture the no-draft restore");
+            bool main_equal = true;
+            for (size_t j=0;j+1<b.kv.size();++j) main_equal = main_equal && equal(back.kv[j],b.kv[j]);
+            check(main_equal && back.live.gdn==b.live.gdn && back.live.ple==b.live.ple && back.live.tails==b.live.tails &&
+                  back.live.dead==b.live.dead && back.live.block_pos==b.live.block_pos,"no-draft restore equals B on the main layers");
+            fill(177);
+        }
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};

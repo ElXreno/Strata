@@ -97,7 +97,9 @@ int main() {
         check(slot_disk_save(in) == SlotSave::no_draft, "--mtp without --batch-mtp: not saved");
         in = idle_slot();
         in.batch_df2 = true;
-        check(slot_disk_save(in) == SlotSave::dflash2, "DFlash2 slot drafters: not saved");
+        check(slot_disk_save(in) == SlotSave::dflash2, "DFlash2 slot drafters beside an MTP layer: not saved");
+        in.use_mtp = false;
+        check(slot_disk_save(in) == SlotSave::save, "DFlash2 slot drafters, no MTP layer: saved without a draft layer");
         in = idle_slot();
         in.active = true;
         in.pictures = true;

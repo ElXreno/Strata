@@ -47,7 +47,7 @@ inline SlotSave slot_disk_save(const SlotSaveInput& in) {
     if (in.pictures) return SlotSave::pictures;
     if (!in.wanted) return SlotSave::short_conv;
     if (in.in_main || in.on_disk) return SlotSave::held;
-    if (in.batch_df2) return SlotSave::dflash2;
+    if (in.batch_df2 && in.use_mtp) return SlotSave::dflash2;
     if (in.use_mtp && !in.batch_mtp) return SlotSave::no_draft;
     return SlotSave::save;
 }
