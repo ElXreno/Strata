@@ -6994,7 +6994,7 @@ int main(int argc, char** argv) {
     auto batch_max_t = [&]() -> int {
         // (--batch-mtp and STRATA_PIPED_MTP draft with the draft layer's kernels, built for the narrow window: their windows
         // stay at most kVerifyNarrowT rows; only the plain batch windows are wide)
-        if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyNarrowT;
+        if (batch_mtp && !piped_mtp) return std::max((int) strata::kernels::kVerifyNarrowT, o.spec);
         const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
         const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
             ? std::min<int>(strata::kernels::kVerifyNarrowT, (o.batch / o.batch_groups) * (1 + pm_drafts)) : 0;
@@ -7364,7 +7364,8 @@ int main(int argc, char** argv) {
                 if (piped_mtp) d->set_force_capture(true);
                 // (mtp_first: the solo drafter is on the first stage's card, so slot b's is carved from its first-stage session)
                 strata::core::SessionState& slot_s = mtp_first ? *bslot_ss[0][(size_t) b] : *bslot_ss.back()[(size_t) b];
-                if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, &mtp)) {
+                if (!d->load(o.mtp, draft_geometry, slot_s, std::min(o.spec, (int) strata::kernels::kVerifyNarrowT), err,
+                             o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
