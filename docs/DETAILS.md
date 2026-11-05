@@ -790,7 +790,7 @@ conversation is captured and the parked ones are spilled. Use a separate directo
 | `--conversation-cache-disk-mib N` | Cap on this model's spill files, default 8192; `0` disables the disk tier. The index holds at most 256 conversations, oldest evicted first. |
 | `--conversation-cache-similarity F` | A disk hit must cover more than this fraction of the new prompt (`common_prefix_tokens / new_prompt_tokens`). Default 0. |
 | `--conversation-cache-n-min N` | A disk hit must share at least N prompt tokens. Default 0. |
-| `--conversation-cache-disk-only` | The cache on disk alone, with no RAM budget (`--conversation-cache-mib` unused). Single GPU, without `--batch` or `--peer-device`. |
+| `--conversation-cache-disk-only` | The cache on disk alone, with no RAM budget (`--conversation-cache-mib` unused). Single GPU, without `--peer-device`. With `--batch`, an idle slot's conversation is written to disk before an admission overwrites it and at shutdown; with `--mtp` that needs `--batch-mtp` (the slot's own draft K/V), and DFlash2 slot drafters are not saved. |
 
 Only a saved checkpoint whose token and image keys are an exact prefix of the new prompt is restored; the last prompt token
 stays unread. A disk hit is read into host RAM first, so it must fit the RAM cache budget and the
