@@ -3089,6 +3089,33 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     n_embd_ = n_embd;
     n_expert_ = n_expert;
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
+    if (const char* wpath = std::getenv("STRATA_LOOKAHEAD_WEIGHTS"); wpath != nullptr && wpath[0] != '\0') {
+        std::FILE* f = std::fopen(wpath, "rb");
+        uint32_t head[4] = {0, 0, 0, 0};
+        if (f == nullptr || std::fread(head, sizeof head, 1, f) != 1 || head[0] != 0x31574b4cu ||
+            head[1] != (uint32_t) routers_.size() || head[2] != (uint32_t) n_expert || head[3] != (uint32_t) n_embd) {
+            if (f != nullptr) std::fclose(f);
+            err = std::string("RouterLookahead: STRATA_LOOKAHEAD_WEIGHTS ") + wpath + " is not a predictor for this model";
+            return false;
+        }
+        bias_.assign(routers_.size(), std::vector<float>((size_t) n_expert, 0.0f));
+        bool ok = true;
+        for (size_t l = 0; l < routers_.size() && ok; ++l)
+            ok = std::fread(routers_[l].data(), 2, routers_[l].size(), f) == routers_[l].size() &&
+                 std::fread(bias_[l].data(), 4, bias_[l].size(), f) == bias_[l].size();
+        std::fclose(f);
+        if (!ok) {
+            err = std::string("RouterLookahead: STRATA_LOOKAHEAD_WEIGHTS ") + wpath + " is short";
+            return false;
+        }
+        const char* bv = std::getenv("STRATA_LOOKAHEAD_B");
+        budget_ = bv != nullptr && std::atoi(bv) > 0 ? std::atoi(bv) : 8;
+        const char* tv = std::getenv("STRATA_LOOKAHEAD_TAU");
+        tau_ = tv != nullptr ? (float) std::atof(tv) : 0.0f;
+        k_ = budget_;
+        std::fprintf(stderr, "strata: look-ahead weights %s: up to %d non-resident experts of the next layer%s\n", wpath, budget_,
+                     tau_ > 0.0f ? (" above probability " + std::to_string(tau_)).c_str() : " by the window's best score");
+    }
     src_ = src;
     x_.assign((size_t) (8 * n_embd), 0.f);
     thread_ = std::thread([this] {
@@ -3281,6 +3308,41 @@ void RouterLookahead::run() {
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
         if (stats_on_) sm.assign((size_t) (3 * words_), 0);
+        if (budget_ > 0) {
+            std::vector<float> best((size_t) n_expert_, -std::numeric_limits<float>::infinity());
+            const std::vector<float>& bias = bias_[(size_t) layer];
+            for (int64_t t = 0; t < nt; ++t) {
+                const float* lt = logits.data() + (size_t) (t * n_expert_);
+                if (tau_ > 0.0f) {
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int64_t e = 0; e < n_expert_; ++e) mx = std::max(mx, lt[e] + bias[(size_t) e]);
+                    double z = 0.0;
+                    for (int64_t e = 0; e < n_expert_; ++e) z += std::exp((double) (lt[e] + bias[(size_t) e] - mx));
+                    for (int64_t e = 0; e < n_expert_; ++e)
+                        best[(size_t) e] = std::max(best[(size_t) e], (float) (std::exp((double) (lt[e] + bias[(size_t) e] - mx)) / z));
+                } else {
+                    for (int64_t e = 0; e < n_expert_; ++e) best[(size_t) e] = std::max(best[(size_t) e], lt[e] + bias[(size_t) e]);
+                }
+            }
+            if (host_res != nullptr)
+                for (int64_t e = 0; e < n_expert_; ++e)
+                    if (host_res[(size_t) (layer * n_expert_ + e)] >= 0) best[(size_t) e] = -std::numeric_limits<float>::infinity();
+            for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
+            std::partial_sort(order.begin(), order.begin() + kmax, order.end(),
+                              [&](int32_t a, int32_t b) { return best[(size_t) a] > best[(size_t) b]; });
+            for (int j = 0; j < kmax; ++j) {
+                const int64_t e = order[(size_t) j];
+                if (!std::isfinite(best[(size_t) e])) break;
+                if (tau_ > 0.0f && best[(size_t) e] <= tau_) break;
+                if (j < budget_) {
+                    want.push_back(e);
+                    wconf.push_back((float) (budget_ - j) / (float) budget_);
+                }
+                if (stats_on_ && dj == 0)
+                    for (int s = 0; s < 3; ++s)
+                        if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
+            }
+        } else
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
