@@ -11769,6 +11769,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+        if (const char* gl = std::getenv("STRATA_GPU_LOOKAHEAD"); gl != nullptr && gl[0] != '\0' && stages.empty()) {
+            const char* tv = std::getenv("STRATA_GPU_LOOKAHEAD_TAU");
+            const char* bv = std::getenv("STRATA_GPU_LOOKAHEAD_B");
+            if (!ver.set_gpu_lookahead(gl, tv != nullptr ? (float) std::atof(tv) : 0.01f, bv != nullptr ? std::atoi(bv) : 6, err)) {
+                std::fprintf(stderr, "strata serve: %s; the GPU look-ahead is off\n", err.c_str());
+                err.clear();
+            }
+        }
 #if defined(STRATA_HAVE_DFLASH2)
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps on a layer split.  Every stage's prompt path taps the requested layers it runs into its own staging and hands them to its
@@ -13019,6 +13027,8 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
             fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
             drive.d.fs = fs_swap.get();
+            drive.d.gpu_pred = ver.gpu_lookahead_host();
+            drive.d.gpu_pred_stride = ver.gpu_lookahead_stride();
             if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
             src.set_foresight_swap(fs_swap.get());   // #2134: the exchanges hold the experts whose bytes they move
         }
@@ -20147,6 +20157,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
+            if (drive.d.gpu_pred) std::fprintf(stderr, "strata serve: GPU look-ahead: %lld predicted copies asked\n", (long long) drive.d.gpu_pred_issued);
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)

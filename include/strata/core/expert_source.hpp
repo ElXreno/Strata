@@ -502,6 +502,9 @@ struct ForesightSwap;
 
 struct ExpertDispatch {
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
+    const int32_t* gpu_pred = nullptr;
+    int gpu_pred_stride = 0;
+    int64_t gpu_pred_issued = 0;
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts

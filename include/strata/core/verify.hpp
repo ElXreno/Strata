@@ -341,6 +341,9 @@ public:
         always_publish_ = on;
         if (on) device_plan_ = false;
     }
+    bool set_gpu_lookahead(const std::string& path, float tau, int max_out, std::string& err);
+    const int32_t* gpu_lookahead_host() const { return pred_host_; }
+    int gpu_lookahead_stride() const { return 1 + pred_max_; }
     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
     /// which never ask the host.  The pointer must outlive the verifier's windows.
     bool set_adapt_gate(AdaptGate* g) {
@@ -740,6 +743,11 @@ private:
     void* arena_ = nullptr;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+    uint16_t* pred_w_ = nullptr;
+    float *pred_b_ = nullptr, *pred_logits_ = nullptr;
+    int32_t *pred_host_ = nullptr, *pred_dev_ = nullptr;
+    float pred_tau_ = 0.01f;
+    int pred_max_ = 0;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
