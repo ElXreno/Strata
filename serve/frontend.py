@@ -443,9 +443,24 @@ def _env_to_user(messages: list[dict]) -> list[dict]:
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
-    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
-    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages: merging them
+    into the first one would change the prompt's start and cost the conversation cache every turn.  One that
+    follows a user message goes before it, so the model's last turn is still the person's request and not a
+    context dump; the move depends on the two messages alone, so every later request renders them the same."""
+    out: list[dict] = []
+    user_at = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and i > 0:
+            late = dict(m, role="user")
+            if user_at is not None:
+                out.insert(user_at, late)
+                user_at += 1
+            else:
+                out.append(late)
+            continue
+        out.append(m)
+        user_at = len(out) - 1 if m.get("role") == "user" else None
+    return out
 
 
 def _object_list(value, name: str) -> list[dict]:
