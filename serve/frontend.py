@@ -451,16 +451,43 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     user_at = None
     for i, m in enumerate(messages):
         if m.get("role") == "system" and i > 0:
-            late = dict(m, role="user")
-            if user_at is not None:
-                out.insert(user_at, late)
-                user_at += 1
-            else:
-                out.append(late)
+            for late in _hook_context_last(dict(m, role="user")):
+                if user_at is not None:
+                    out.insert(user_at, late)
+                    user_at += 1
+                else:
+                    out.append(late)
             continue
         out.append(m)
         user_at = len(out) - 1 if m.get("role") == "user" else None
     return out
+
+
+_HOOK_CONTEXT = re.compile(r"\A\S+ hook additional context: ")
+_SECTION_START = re.compile(r"\n+(?=# )")
+
+
+def _hook_context_last(m: dict) -> list[dict]:
+    """Claude Code opens a late context message with its hooks' output, which changes from one sub-agent to the next,
+    before the environment, instructions and skills, which do not: the stable part goes first as its own turn, so its
+    end is a turn boundary every sub-agent shares and the conversation cache can keep a root there."""
+    content = m.get("content")
+    parts = None
+    if isinstance(content, list):
+        if len(content) != 1 or not isinstance(content[0], dict) or content[0].get("type") != "text":
+            return [m]
+        parts, content = content, content[0].get("text")
+    if not isinstance(content, str) or not _HOOK_CONTEXT.match(content):
+        return [m]
+    cut = _SECTION_START.search(content)
+    if cut is None:
+        return [m]
+    hooks, stable = content[:cut.start()], content[cut.end():]
+    if not hooks.strip() or not stable.strip():
+        return [m]
+    if parts is not None:
+        return [dict(m, content=[dict(parts[0], text=stable)]), dict(m, content=[dict(parts[0], text=hooks)])]
+    return [dict(m, content=stable), dict(m, content=hooks)]
 
 
 def _object_list(value, name: str) -> list[dict]:
