@@ -1619,6 +1619,27 @@ class ClientShapes(unittest.TestCase):
         plain = [{"role": "system", "content": "S"}, {"role": "user", "content": "q"}, {"role": "system", "content": "no hooks\n# here"}]
         self.assertEqual([m["content"] for m in _late_system_to_user(plain)], ["S", "no hooks\n# here", "q"])
 
+    def test_leading_reminders_are_their_own_turns(self):
+        from serve.frontend import anthropic_to_messages
+        rules = "<system-reminder>\ninstructions\n</system-reminder>"
+        git = "<system-reminder>\ngit status\n</system-reminder>\n"
+
+        def roles_and_texts(task, late="ctx"):
+            req = {"system": "S", "messages": [{"role": "user", "content": [{"type": "text", "text": rules},
+                                                                          {"type": "text", "text": git},
+                                                                          {"type": "text", "text": task}]},
+                                               {"role": "system", "content": late}]}
+            msgs, _, _ = anthropic_to_messages(req)
+            return [(m["role"], m["content"]) for m in msgs]
+
+        self.assertEqual(roles_and_texts("task one"), [("system", "S"), ("user", rules), ("user", git), ("user", "ctx"),
+                                                       ("user", "task one")])
+        self.assertEqual(roles_and_texts("task two")[:4], roles_and_texts("task one")[:4])
+        only = {"messages": [{"role": "user", "content": [{"type": "text", "text": rules}]}]}
+        self.assertEqual([m["content"] for m in anthropic_to_messages(only)[0]], [rules])
+        mixed = {"messages": [{"role": "user", "content": [{"type": "text", "text": "plain"}, {"type": "text", "text": rules}]}]}
+        self.assertEqual([m["content"] for m in anthropic_to_messages(mixed)[0]], ["plain" + rules])
+
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
         msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})

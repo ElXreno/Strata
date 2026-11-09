@@ -463,6 +463,16 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _reminder_lead(texts: list[str]) -> int:
+    """How many leading text blocks of a user message are Claude Code's <system-reminder> context (the instructions,
+    the git status) ahead of the request itself: each becomes its own turn, so the request's start is a turn boundary
+    and the stable context before it can be the conversation cache's root."""
+    n = 0
+    while n < len(texts) and texts[n].lstrip().startswith("<system-reminder>"):
+        n += 1
+    return n if 0 < n < len(texts) and "".join(texts[n:]).strip() else 0
+
+
 _HOOK_CONTEXT = re.compile(r"\A\S+ hook additional context: ")
 _SECTION_START = re.compile(r"\n+(?=# )")
 
@@ -771,6 +781,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
                     _tool_references(block.get("content"), deferred),
                     f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+        if m["role"] == "user" and not calls and not reasoning and not _has_image(parts) and not any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content or []):
+            lead = _reminder_lead(text)
+            messages.extend({"role": "user", "content": t} for t in text[:lead])
+            text = text[lead:]
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
