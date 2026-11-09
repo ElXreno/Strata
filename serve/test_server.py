@@ -1601,6 +1601,24 @@ class ClientShapes(unittest.TestCase):
         first = _late_system_to_user(msgs[:4])
         self.assertEqual(out[:len(first)], first)                                  # an earlier request stays a prefix
 
+    def test_hook_context_goes_after_the_stable_context(self):
+        from serve.frontend import _late_system_to_user
+        stable = "# Environment\nYou have been invoked in the following environment\n\nToday's date is 2026-11-09."
+
+        def ctx(hooks):
+            return "SubagentStart hook additional context: " + hooks + "\n\n\n" + stable
+
+        for content, task in ((ctx("topics 12, recall a"), "task one"), ([{"type": "text", "text": ctx("topics 13")}], "task two")):
+            out = _late_system_to_user([{"role": "system", "content": "S"}, {"role": "user", "content": task},
+                                        {"role": "system", "content": content}])
+            texts = [m["content"] if isinstance(m["content"], str) else m["content"][0]["text"] for m in out]
+            self.assertEqual(texts[0], "S")
+            self.assertEqual(texts[1], stable)
+            self.assertTrue(texts[2].startswith("SubagentStart hook additional context: "))
+            self.assertEqual(texts[3], task)
+        plain = [{"role": "system", "content": "S"}, {"role": "user", "content": "q"}, {"role": "system", "content": "no hooks\n# here"}]
+        self.assertEqual([m["content"] for m in _late_system_to_user(plain)], ["S", "no hooks\n# here", "q"])
+
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
         msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})
