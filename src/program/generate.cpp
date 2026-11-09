@@ -12271,8 +12271,8 @@ int main(int argc, char** argv) {
                     root = &c;
             int64_t first_turn = -1;
             if (root == nullptr && o.prompt_cache_root > 0 && o.turn_token >= 0) {
-                for (size_t i = 1; i < live.size(); ++i)
-                    if (live[i] == o.turn_token) { if ((int64_t) i >= o.prompt_cache_root) first_turn = (int64_t) i; break; }
+                for (size_t i = (size_t) o.prompt_cache_root; i < live.size(); ++i)
+                    if (live[i] == o.turn_token) { first_turn = (int64_t) i; break; }
                 if (first_turn > 0)
                     for (const ConvCheckpoint& c : checks)
                         if ((int64_t) c.ids.size() == first_turn && !c.gdn.empty()) root = &c;
@@ -18580,9 +18580,9 @@ int main(int argc, char** argv) {
             if (!req_ckpt) turn_at = -1;
             int64_t root_at = -1;
             if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
-                for (int64_t i = 1; i < last_turn; ++i)
+                for (int64_t i = o.prompt_cache_root; i < last_turn; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
-                        if (i >= o.prompt_cache_root) root_at = i;
+                        root_at = i;
                         break;
                     }
             static const bool message_checkpoint = [] {
