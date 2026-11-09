@@ -1472,7 +1472,7 @@ class ClientShapes(unittest.TestCase):
         self.assertIn("You are terse.", text)
         self.assertIn("<system-reminder>answer in digits</system-reminder>", text)
         self.assertLess(text.index("You are terse."), text.index("1+1?"))          # the first system stays first
-        self.assertLess(text.index("1+1?"), text.index("answer in digits"))        # the late one stays in place
+        self.assertLess(text.index("answer in digits"), text.index("1+1?"))        # the late one goes before the request
 
     def test_openai_late_developer_and_system(self):
         status, b = self.post("/v1/chat/completions", {
@@ -1587,6 +1587,19 @@ class ClientShapes(unittest.TestCase):
                 v.encode("x")
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
+
+    def test_late_system_goes_before_the_user_turn_it_follows(self):
+        from serve.frontend import _late_system_to_user
+        msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "q1"},
+                {"role": "system", "content": "ctx1"}, {"role": "system", "content": "ctx2"},
+                {"role": "assistant", "content": "a1"}, {"role": "system", "content": "mid"},
+                {"role": "user", "content": "q2"}, {"role": "system", "content": "ctx3"}]
+        out = _late_system_to_user(msgs)
+        self.assertEqual([m["content"] for m in out], ["S", "ctx1", "ctx2", "q1", "a1", "mid", "ctx3", "q2"])
+        self.assertEqual([m["role"] for m in out],
+                         ["system", "user", "user", "user", "assistant", "user", "user", "user"])
+        first = _late_system_to_user(msgs[:4])
+        self.assertEqual(out[:len(first)], first)                                  # an earlier request stays a prefix
 
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
