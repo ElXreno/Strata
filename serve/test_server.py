@@ -5793,6 +5793,50 @@ class CountingEngine(MockEngine):
             yield t
 
 
+class SamplingEngine(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.last_sampling = dict(sampling)
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class SideQuery(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = SamplingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def checkpointed(self, body, env=None):
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps({"model": "m", "max_tokens": 32, **body}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with mock.patch.dict(os.environ, env or {}), urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+        return self.engine.last_sampling.get("strata_checkpoint") is not False
+
+    def test_a_toolless_single_message_is_one_shot(self):
+        body = {"system": "You are Claude Code.", "messages": [{"role": "user", "content": "summarize this page"}], "tools": []}
+        self.assertFalse(self.checkpointed(body))
+
+    def test_agent_turns_keep_their_checkpoints(self):
+        tool = {"name": "read", "description": "read a file", "input_schema": {"type": "object", "properties": {}}}
+        self.assertTrue(self.checkpointed({"messages": [{"role": "user", "content": "task"}], "tools": [tool]}))
+        self.assertTrue(self.checkpointed({"messages": [{"role": "user", "content": "q"}], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}))
+        turns = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}]
+        self.assertTrue(self.checkpointed({"messages": turns}))
+
+    def test_switch_and_client_choice(self):
+        body = {"messages": [{"role": "user", "content": "summarize"}]}
+        self.assertTrue(self.checkpointed(body, {"STRATA_SIDE_QUERY_ONESHOT": "0"}))
+        self.assertTrue(self.checkpointed({**body, "strata_checkpoint": True}))
+
+
 class StopStrings(unittest.TestCase):
     """OpenAI `stop` and Anthropic `stop_sequences`: the answer ends before the first stop string, which is not sent,
     and the engine stops there.  The byte tokenizer gives one token per byte, so every stop string here is split
