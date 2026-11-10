@@ -42,8 +42,8 @@ class Parsing(unittest.TestCase):
                                                                  {"type": "input_text", "text": "D2"}]},
             {"role": "user", "content": "u"},
             {"type": "message", "role": "developer", "content": "late"}]})
-        self.assertEqual(msgs, [{"role": "system", "content": "I\n\nD1D2"}, {"role": "user", "content": "u"},
-                                {"role": "user", "content": "late"}])
+        self.assertEqual(msgs, [{"role": "system", "content": "I\n\nD1D2"}, {"role": "user", "content": "late"},
+                                {"role": "user", "content": "u"}])
 
     def test_codex_history_becomes_one_assistant_turn_per_answer(self):
         items = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "edit it"}]},
